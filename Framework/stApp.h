@@ -36,9 +36,6 @@
 #include "devui/imassets.h"
 #include "SubWinStatus.h"
 #include "render/LensFlare.h"
-#include "render/Projector.h"
-#include "render/Laser.h"
-#include "render/Optics.h"
 #include "render/GraphicsAPI.h"
 #include "render/detroit/DetroitRenderer.h"
 #include "render/detroit/DetroitSplash.h"
@@ -216,37 +213,11 @@ public:
     SceneManager     sceneManager;
     ZmqHandler       zmqHandler;
 
-    // The game's render path (Detroit: a wi::RenderPath3D carrying the projector pass). The
-    //	editor's Game Viewport shows it; a project tunes it in OnRenderPathSetup.
-    st::ProjectorRenderPath& GamePath() { return renderer_->GamePath(); }
+    // The game's render path (Detroit: a wi::RenderPath3D). The editor's Game Viewport shows
+    //	it; a project tunes it in OnRenderPathSetup. Extensions hang their passes on it from
+    //	an st::AppSystem (stAppSystem.h) - Simtary's projectors and lasers live there now.
+    st::GameRenderPath& GamePath() { return renderer_->GamePath(); }
     st::LensFlare& LensFlare() { return renderer_->LensFlare(); }
-
-    // Square/rectangular image projection with projector optics. Not a LightComponent:
-    // the engine's spot light is a cone by construction, so a mask texture on one
-    // always lands as a circle. See Framework/render/Projector.h.
-    //
-    // Also reachable from anywhere as st::ProjectorSystem::Get(), which is how a
-    // scene or a native component gets at it:
-    //
-    //   ProjectorSystem::ID id = st::ProjectorSystem::Get().Add(projector);
-    //   st::ProjectorSystem::Get().Find(id)->intensity = 12.0f;
-    st::ProjectorSystem& Projectors() { return renderer_->Projectors(); }
-
-    // Traced laser beams: millimetre-thin shafts that bounce off mirrors, bend
-    // through lenses, stop on the first surface they meet, and leave a fading trail
-    // where they land so a moving beam draws instead of blinking. The projector pass
-    // ray marches and steps straight over something this thin; this one is closed
-    // form. See Framework/render/Laser.h.
-    //
-    // Also reachable from anywhere as st::LaserSystem::Get():
-    //
-    //   LaserSystem::ID id = st::LaserSystem::Get().Add(laser);
-    //   st::LaserSystem::Get().Path(id)->hit.entity;   // what the beam is on
-    st::LaserSystem& Lasers() { return renderer_->Lasers(); }
-
-    // The mirrors and lenses those beams travel through. Separate from the lasers
-    // because one mirror serves every beam in the scene. See Framework/render/Optics.h.
-    st::OpticsSystem& Optics() { return optics_; }
 
     // Create the graphics device for `api` before the engine would, so the backend
     // is the framework's choice rather than wiApplication's built-in default. st::Run
@@ -446,11 +417,6 @@ private:
     // Loads/unloads AOT Faust processors, played through the engine OpenAL stream.
     st::audio::FaustManager faustManager;
 
-    // Reached through Optics(). CPU only (the beams and virtual projectors are the
-    //	renderer's), and declared before renderer_ on purpose: the laser system traces
-    //	through the optics, so the optics must outlive it - members are destroyed in
-    //	reverse declaration order.
-    st::OpticsSystem optics_;
 
     // Lazily-loaded icon shown in the About window; held so its texture stays alive.
     wi::Resource aboutEngineIcon;

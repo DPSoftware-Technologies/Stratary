@@ -1,4 +1,5 @@
 #include "stApp.h"
+#include "stAppSystem.h"
 #include <SDL.h>
 #include <cstdio>
 #include <cstdlib>
@@ -321,12 +322,8 @@ void st::App::Initialize() {
     // window rather than the one st::Run happened to open.
     displaySettings_.LoadAndApply(st::SettingsManager::Get().SubCompound("display"), *this);
 
-    // Optics first: it has no GPU state of its own, and the laser system traces through
-    // it from the moment it starts running.
-    optics_.Init();
-
-    // The game path and what rides on it (lens flare, projectors, lasers), the saved
-    // graphics options. The project's render hooks go with it.
+    // The game path and what rides on it (lens flare, the extensions' app systems), the
+    // saved graphics options. The project's render hooks go with it.
     st::render::detroit::DetroitRenderer::Hooks hooks;
     hooks.onPathSetup = [this](wi::RenderPath3D& path) { OnRenderPathSetup(path); };
     hooks.onPreCompose = [this](wi::graphics::CommandList cmd) { OnPreCompose(cmd); };
@@ -339,7 +336,6 @@ void st::App::Initialize() {
         if (hurricanes_->Ready()) st::render::Install(hurricanes_.get());
     }
 #endif
-    optics_.LoadFrom(st::SettingsManager::Get().SubCompound("optics"));
     st::DayNight::Get().LoadFrom(st::SettingsManager::Get().SubCompound("daynight"));
 
     // Edit / Play mode transitions (snapshot, restore, reload) are applied by
@@ -688,11 +684,9 @@ void st::App::Update(float dt) {
     if (MobileMinimal()) ApplyMobileMinimalWeather(wi::scene::GetScene());
 
     // After sceneManager.Update: followed entities carry this frame's transform only after
-    // the scene update. Optics FIRST, then the renderer's effects that reflect through
-    // them. A mirror bolted to a moving rig has to be where it will be DRAWN before a beam
-    // is traced off it or a virtual projector is placed behind it, or the reflection lags
-    // the mirror by a frame - which reads as the reflection sliding around on its own.
-    optics_.Update(wi::scene::GetScene());
+    // the scene update. The extensions' app systems first (in their own order - Simtary
+    // traces its optics before the beams that reflect off them), then the renderer's effects.
+    st::appsystems::UpdateAll(wi::scene::GetScene(), dt);
     renderer_->Update(dt);
     renderer_->SetDebugOverlays(debugOverlays_);
 
@@ -803,9 +797,9 @@ void st::App::Exit() {
 
     // Persist current graphics + any option edits on the way out, so quitting without
     // pressing Apply still keeps the live settings.
-    renderer_->SaveSettings();
+    renderer_->SaveSettings();          // also every app system's SaveTo
+    st::appsystems::ShutdownAll();      // then their GPU state, while the device still exists
     displaySettings_.SaveTo(st::SettingsManager::Get().SubCompound("display"));
-    optics_.SaveTo(st::SettingsManager::Get().SubCompound("optics"));
     st::DayNight::Get().SaveTo(st::SettingsManager::Get().SubCompound("daynight"));
     st::SettingsManager::Get().SubCompound("input")
         .putInt("gamepadBackend", int(wi::input::GetGamepadBackend()));

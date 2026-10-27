@@ -24,7 +24,7 @@ set(SIMTARY_DETROIT_ONLY
     # device and points the shader path at its backend's folder.
     "stApp\\.h" "stApp\\.cpp" "stRun\\.cpp"
     # Effects that ride on RenderPath3D's post-process chain with their own shaders.
-    "render/LensFlare\\..*" "render/Projector\\..*" "render/Laser\\..*" "render/Framebuffer\\..*"
+    "render/LensFlare\\..*" "render/Framebuffer\\..*" "render/GameRenderPath\\.h"
     # Backend selection and device creation (DirectX 12 / Vulkan).
     "render/GraphicsAPI\\..*"
     # Bound to the D3D12 device: OpenXR session, hardware video encode.
@@ -102,6 +102,9 @@ set(_forbidden
     "#include[ \t]*\"flight/"
     "#include[ \t]*\"jsbsim_c\\.h\""
     "SIMTARY_HAS_JSBSIM"
+    "#include[ \t]*\"render/(Laser|Projector|Optics)\\.h\""
+    "(Laser|Projector|Optics)System"
+    "Stl?(Laser|Projector)Interop"
 )
 _st_boundary_scan("${FRAMEWORK_DIR}" "" _extension_hits)
 if (_extension_hits)

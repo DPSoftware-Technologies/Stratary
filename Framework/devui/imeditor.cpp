@@ -971,7 +971,7 @@ void st::EditorUI::DrawGameViewportToolbar()
 		return;
 
 	// Free Aspect is the only mode a shipping build has: the path follows the window canvas.
-	//	Anything else forces st::ProjectorRenderPath::forcedResolution and the image below is
+	//	Anything else forces st::GameRenderPath::forcedResolution and the image below is
 	//	letterboxed into whatever shape the dock happens to give the panel.
 	if (ImGui::BeginMenu(gameRes_.fixed ? "Fixed Resolution" : "Free Aspect"))
 	{

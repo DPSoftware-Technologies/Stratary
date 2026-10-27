@@ -4,6 +4,7 @@
 #include "render/detroit/DetroitDraw2D.h"
 
 #include "io/SettingsManager.h"
+#include "stAppSystem.h"
 #include "xr/XRSystem.h"
 
 #include "wiApplication.h"
@@ -67,8 +68,6 @@ void DetroitRenderer::Initialize (wi::Application& app, Hooks hooks) {
     // The device exists and the shader path has its backend subfolder appended
     //	(wi::Application::Initialize ran).
     lensFlare_.Init();
-    projectors_.Init();
-    lasers_.Init();
 
     gamePath_.init(app.canvas);
     gamePath_.Load();
@@ -91,18 +90,9 @@ void DetroitRenderer::Initialize (wi::Application& app, Hooks hooks) {
     // Only claim the path if the project did not activate one of its own.
     if (app.GetActivePath() == nullptr) app.ActivatePath(&gamePath_);
 
-    // The projector pass rides on the render path's custom post process list, so it
-    // has to be told which path after the setup hook has had its say. It only inserts
-    // itself while there is something to draw.
-    projectors_.Bind(gamePath_);
-    // The path records the projector depth maps at the top of its post process chain,
-    // where this frame's render data is already uploaded (see ProjectorRenderPath).
-    gamePath_.projectors = &projectors_;
-
-    // The laser pass rides on the same custom post process list, for the same reason
-    // and at the same stage. It has no shadow maps, so it needs nothing from the path
-    // beyond the hook.
-    lasers_.Bind(gamePath_);
+    // Extensions' app systems (stAppSystem.h) hang their passes on the path now - after the
+    // setup hook has had its say, so they bind to the path that is actually live.
+    st::appsystems::InitAll(gamePath_);
 
     LoadSettings();
     if (wi::arguments::HasArgument("mobile_minimal")) ApplyMobileMinimal(gamePath_);
@@ -112,15 +102,13 @@ void DetroitRenderer::LoadSettings () {
     // Push saved graphics options to the engine now, so the first frame reflects them.
     if (app_ != nullptr) graphics_.loadAndApply(st::SettingsManager::Get().GraphicsTag(), gamePath_, *app_);
     lensFlare_.LoadFrom(st::SettingsManager::Get().SubCompound("lensflare"));
-    projectors_.LoadFrom(st::SettingsManager::Get().SubCompound("projectors"));
-    lasers_.LoadFrom(st::SettingsManager::Get().SubCompound("lasers"));
+    st::appsystems::LoadAll();
 }
 
 void DetroitRenderer::SaveSettings () {
     graphics_.SaveTo(st::SettingsManager::Get().GraphicsTag());
     lensFlare_.SaveTo(st::SettingsManager::Get().SubCompound("lensflare"));
-    projectors_.SaveTo(st::SettingsManager::Get().SubCompound("projectors"));
-    lasers_.SaveTo(st::SettingsManager::Get().SubCompound("lasers"));
+    st::appsystems::SaveAll();
 }
 
 void DetroitRenderer::Shutdown () {
@@ -135,11 +123,8 @@ void DetroitRenderer::Update (float dt) {
     // and the camera has already moved this frame, so the projected sun position matches
     // what the render path is about to draw. Followed entities carry this frame's
     // transform too, and the passes' constants must be in place before Render().
-    // (st::App runs the CPU optics BEFORE this, so a beam or a virtual projector is
-    // placed off a mirror where it will be drawn.)
+    // (st::App runs the extensions' app systems just before this.)
     lensFlare_.Update(wi::scene::GetScene(), wi::scene::GetCamera(), dt);
-    projectors_.Update(wi::scene::GetScene(), dt);
-    lasers_.Update(wi::scene::GetScene(), dt);
 }
 
 void DetroitRenderer::RenderXREyes (float dt) {

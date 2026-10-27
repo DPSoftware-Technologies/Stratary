@@ -18,8 +18,7 @@
 
 #include "render/api/Renderer.h"
 #include "render/LensFlare.h"
-#include "render/Projector.h"
-#include "render/Laser.h"
+#include "render/GameRenderPath.h"
 #include "devui/imgraphicsettings.h"
 
 #include "wiGraphicsDevice.h"
@@ -107,10 +106,8 @@ public:
     // Before the device goes away.
     void Shutdown ();
 
-    st::ProjectorRenderPath& GamePath () { return gamePath_; }
+    st::GameRenderPath& GamePath () { return gamePath_; }
     st::LensFlare& LensFlare () { return lensFlare_; }
-    st::ProjectorSystem& Projectors () { return projectors_; }
-    st::LaserSystem& Lasers () { return lasers_; }
     GraphicsSettings& Graphics () { return graphics_; }
 
 private:
@@ -128,10 +125,8 @@ private:
     wi::Application* app_ = nullptr;
     Hooks hooks_;
 
-    st::ProjectorRenderPath gamePath_;
+    st::GameRenderPath gamePath_;
     st::LensFlare lensFlare_;
-    st::ProjectorSystem projectors_;
-    st::LaserSystem lasers_;
     GraphicsSettings graphics_;
 
     Texture gameImage_;

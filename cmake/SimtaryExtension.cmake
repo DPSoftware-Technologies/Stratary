@@ -6,8 +6,11 @@
 #
 #   stratary_define_extension(NAME <name>
 #       [FRAMEWORK_DIR <dir>]       # compiled into each app WITH the framework (default <ext>/Framework)
+#       [INCLUDES <dirs...>]        # extra include paths (e.g. shader interop headers shared with C++)
 #       [LIBS <targets...>]         # linked to every app that uses it
 #       [RUNTIME <targets...>]      # shared libraries copied next to the app's executable
+#       [ENGINE_SHADERS <profile>:<file.hlsl>...]   # compiled per app with the engine's shader
+#                                   # environment (globals.hlsli, bindless heaps), e.g. cs_6_0:...
 #   )
 #
 # A game pulls it in after the bootstrap and names it when it adds itself:
@@ -41,7 +44,7 @@ endfunction()
 # carries the include path and libraries (usage requirements) plus two custom properties
 # simtary_add_app reads: the source list and the runtime libraries to stage.
 function(stratary_define_extension)
-    cmake_parse_arguments(EXT "" "NAME;FRAMEWORK_DIR" "LIBS;RUNTIME" ${ARGN})
+    cmake_parse_arguments(EXT "" "NAME;FRAMEWORK_DIR" "INCLUDES;LIBS;RUNTIME;ENGINE_SHADERS" ${ARGN})
     if (NOT EXT_NAME)
         message(FATAL_ERROR "stratary_define_extension: NAME is required")
     endif()
@@ -54,13 +57,14 @@ function(stratary_define_extension)
     )
     set(_t StExt_${EXT_NAME})
     add_library(${_t} INTERFACE)
-    target_include_directories(${_t} INTERFACE ${EXT_FRAMEWORK_DIR})
+    target_include_directories(${_t} INTERFACE ${EXT_FRAMEWORK_DIR} ${EXT_INCLUDES})
     if (EXT_LIBS)
         target_link_libraries(${_t} INTERFACE ${EXT_LIBS})
     endif()
     set_target_properties(${_t} PROPERTIES
         ST_EXT_SOURCES "${_sources}"
         ST_EXT_RUNTIME "${EXT_RUNTIME}"
+        ST_EXT_ENGINE_SHADERS "${EXT_ENGINE_SHADERS}"
     )
     message(STATUS "Stratary: extension ${EXT_NAME} (${EXT_FRAMEWORK_DIR})")
 endfunction()

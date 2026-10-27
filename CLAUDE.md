@@ -9,13 +9,14 @@ new one). It was called Simtary until 2026-10-27; the internal names (`SimtaryBo
 project-specific belongs here — if a change only serves one game, it goes in that game's `src/`.
 
 **Simtary** is now the simulation layer on top (`../Simtary`, a separate private repo): flight
-dynamics on JSBSim today, sensors/optics/ROS2 later. It is a Stratary EXTENSION
+dynamics on JSBSim and the optics (projectors, lasers, mirrors, lenses) today; sensors/ROS2 later. It is a Stratary EXTENSION
 (`cmake/SimtaryExtension.cmake`): a game opts in with `stratary_add_extension(<dir>)` +
 `simtary_add_app(... EXTENSIONS Simtary)`, and its `Framework/` is compiled in beside this
 one. **The dependency goes one way**: Simtary includes Stratary headers; Stratary's
 `Framework/` never includes Simtary's, and the boundary build step fails if it does
 (`cmake/SimtaryRenderBoundary.cmake`, end of file). When Stratary code needs to reach
-extension behaviour, give it a hook instead - `damage/Damage.h` `DamageHooks` is the pattern.
+extension behaviour, give it a hook instead - `damage/Damage.h` `DamageHooks` (per-entity) and
+`stAppSystem.h` (frame systems) are the patterns.
 The `template` project builds without the extension; that is the proof the line holds.
 
 Workspace layout: `HMMWV4/Stratary`, `HMMWV4/Simtary`, `HMMWV4/Projects/<game>`. Projects
@@ -50,7 +51,9 @@ library) because each app needs its own generated `version.h` and `AppConfig`.
 
 | File | Role |
 |---|---|
-| `stApp.h/.cpp` | `st::App` (a `wi::Application`) + `st::AppConfig` + `st::DevUIMode` + `st::LoadingState`. Owns the scene manager, ImGui (context, style, SDL input), Faust, ZMQ, settings, and `renderer_` (`render/detroit`), which owns the game path, lens flare, projectors, lasers, graphics options and the ImGui GPU backend - reached through `GamePath()`, `LensFlare()`, `Projectors()`, `Lasers()`, `Graphics()` (Detroit types). Project hook surface is listed below. |
+| `stApp.h/.cpp` | `st::App` (a `wi::Application`) + `st::AppConfig` + `st::DevUIMode` + `st::LoadingState`. Owns the scene manager, ImGui (context, style, SDL input), Faust, ZMQ, settings, and `renderer_` (`render/detroit`), which owns the game path (`st::GameRenderPath`), lens flare, graphics options and the ImGui GPU backend - reached through `GamePath()`, `LensFlare()`, `Graphics()` (Detroit types). Extensions' frame systems are `st::AppSystem`s (`stAppSystem.h`), not members. Project hook surface is listed below. |
+| `stAppSystem.*` | **App systems** - how an EXTENSION adds a frame-level system without st::App knowing it. `struct X : st::AppSystem` + `ST_REGISTER_APP_SYSTEM(X)` (static registration): `Init(GameRenderPath&)` once the game path exists (after `OnRenderPathSetup`, from `DetroitRenderer::Initialize`), `LoadFrom`/`SaveTo` the options.stad sub-compound `Name()`, `Update(scene, dt)` every frame after the scene update and before the renderer's own effects, in `Order()`, `SettingsGUI()` as a Graphics Settings > Content section titled `Label()`, `Shutdown()` on exit in REVERSE order while the device exists. Simtary's optics (100), projectors (110) and lasers (120) are the users. |
+| `render/GameRenderPath.h` | `st::GameRenderPath` - the game's `wi::RenderPath3D` (was `st::ProjectorRenderPath`): `forcedResolution` (editor Game Viewport > Resolution, re-applied in `PreUpdate` because `wi::Application::Update` calls `init(canvas)` every frame) and `beforePostprocess`, passes recorded at the top of the post process chain where this frame's render data is already uploaded (Simtary's projector shadow maps). Detroit-only (render boundary list). |
 | `stProject.h.in` | Template for the generated `stProject.h` (`ST_PROJECT_NAME` / `_ORGANIZATION` / `_COPYRIGHT` / `_VERSION`), filled from the `.stpd` manifest at configure time. |
 | `stRun.h/.cpp` | `st::Run(argc, argv, config, app)` — window, splash, SDL event loop, input routing, shutdown. The project owns `main()`; this owns everything after it. |
 | `stScene.h/.cpp` | `Scene` base class: `Load` / `Update` / `OnGUI` / `OnDevGUI` / `Unload`, plus `ReportProgress()`. |
@@ -63,7 +66,7 @@ library) because each app needs its own generated `version.h` and `AppConfig`.
 | `scene/FileScene.*` | `st::FileScene` - a scene that is nothing but a map file, loaded flat. What `DiscoverScenes()` registers for each map it finds. |
 | `scene/RuntimeScene.*` | `st::RuntimeScene` - the empty scene the Scene Manager's "New scene" creates: a sun and a sky, and an `Unload()` that removes everything added while it was active. |
 | `ImguiHelper.cpp` | ImGui context, theme, SDL platform backend and the per-frame UI ordering. The GPU half (font atlas, pipeline, draw) is `DetroitRenderer::CreateImGuiObjects` / `RenderImGui` in `render/detroit/DetroitHost.cpp`. |
-| `render/api/Renderer.*` | **The render interface** (EDITIONS.md Phase 1). `st::render::Get()` is the active renderer: `Caps`, `GameImage()` / `GameResolution()`, `SaveImage`, `ToResource` (a renderer texture where scene data keeps textures: materials, emitters), `ImGuiTexture` (ImTextureID for a TextureRef or a `wi::Resource`), `PickRay(x, y, viewW, viewH, camera?)`, thread-safe `DebugLine/Box/Sphere` (queued, drawn next frame), `DebugOverlays`, `PipelinesCompiling`, `AdapterName`, `VideoMemory`, frame `Update(dt)`, `Load/SaveSettings`. `Draw2D` (`Get().UI()`) is the game UI's 2D: `LoadTexture`/`FromResource`/`CreateTexture`/`CreateRenderTarget`/`LoadFont`, `Begin(target)`..`End`, `SetScissor`, `DrawImage` (9-slice via source rect, rounding, gradient, pivot/rotation), `DrawString`, `CompileGeometry`/`DrawGeometry` (RmlUi). Handles are `shared_ptr` to backend subclasses (`TextureRef`, `GeometryRef`). **Framework code uses this, not `wi::renderer` / `wi::graphics` / `wi::image` / `wi::font` - enforced by `cmake/SimtaryRenderBoundary.cmake`**, a build step that fails on device/renderer use (headers, `wi::renderer::`, `GetDevice()`, GPU object types, image/font drawing) outside its `SIMTARY_DETROIT_ONLY` list (the backend; the `wi::Application` host `stApp.*`/`stRun.cpp`; lens flare, projector, laser, framebuffer, GraphicsAPI; XR; streaming; the editor's viewports, template preview, terrain panel, graphics options). Scene DATA types from renderer headers (sprite/font params, shading rate) stay allowed. Game code is scanned too, as warnings. |
+| `render/api/Renderer.*` | **The render interface** (EDITIONS.md Phase 1). `st::render::Get()` is the active renderer: `Caps`, `GameImage()` / `GameResolution()`, `SaveImage`, `ToResource` (a renderer texture where scene data keeps textures: materials, emitters), `ImGuiTexture` (ImTextureID for a TextureRef or a `wi::Resource`), `PickRay(x, y, viewW, viewH, camera?)`, thread-safe `DebugLine/Box/Sphere` (queued, drawn next frame), `DebugOverlays`, `PipelinesCompiling`, `AdapterName`, `VideoMemory`, frame `Update(dt)`, `Load/SaveSettings`. `Draw2D` (`Get().UI()`) is the game UI's 2D: `LoadTexture`/`FromResource`/`CreateTexture`/`CreateRenderTarget`/`LoadFont`, `Begin(target)`..`End`, `SetScissor`, `DrawImage` (9-slice via source rect, rounding, gradient, pivot/rotation), `DrawString`, `CompileGeometry`/`DrawGeometry` (RmlUi). Handles are `shared_ptr` to backend subclasses (`TextureRef`, `GeometryRef`). **Framework code uses this, not `wi::renderer` / `wi::graphics` / `wi::image` / `wi::font` - enforced by `cmake/SimtaryRenderBoundary.cmake`**, a build step that fails on device/renderer use (headers, `wi::renderer::`, `GetDevice()`, GPU object types, image/font drawing) outside its `SIMTARY_DETROIT_ONLY` list (the backend; the `wi::Application` host `stApp.*`/`stRun.cpp`; lens flare, framebuffer, GameRenderPath, GraphicsAPI; XR; streaming; the editor's viewports, template preview, terrain panel, graphics options). Scene DATA types from renderer headers (sprite/font params, shading rate) stay allowed. Game code is scanned too, as warnings. |
 | `render/api/Backend.*`, `render/hurricanes/*` | **Renderer choice + the Hurricanes (Filament) renderer** (EDITIONS.md, Phase 3 spike). CMake `SIMTARY_RENDERERS` (default `Detroit`; `"Detroit;Hurricanes"` links `deps/filament-install`, built once by `tools/build_filament.ps1` from PowerShell - Filament refuses Git Bash's MSYS2) decides what a build carries; `--renderer=hurricanes` what a run uses (restart to change). A Hurricanes run: Wicked on `GraphicsDevice_Null` (like `--server`), `HurricanesRenderer` on the window, mirroring `wi::scene` into Filament each frame (Z-mirrored; LOD-0 meshes, `materials/StLit.mat` compiled by matc into `shaders/filament/`, sun, camera, terrain layer blend as vertex colour). Its TUs build as C++20 (Filament headers). 2D (game UI, RmlUi, ImGui) is `HurricanesUI.*`: one batch per frame drawn in an orthographic overlay view (`materials/StUi.mat`; stb_truetype text). Filament samples v bottom-up - both materials flip v. **Play-only by decision**: editor mode is refused on a Hurricanes run (`EditorUI::SetEnabled`, `--edit` ignored) - authoring is Detroit's. No debug shapes/skinning/point lights/UI world canvases yet - see EDITIONS.md "Phase 3 spike as built". |
 | `render/detroit/*` | `DetroitRenderer` - `st::render` on Wicked. `DetroitRenderer.cpp` (interface), `DetroitDraw2D.*` (wi::image, wi::font, the `StUi{VS,PS}` geometry pipeline; each `Begin` records its own command list), `DetroitHost.cpp` (the host half st::App drives: `Initialize(app, hooks)` - effects, game path, `OnRenderPathSetup`, saved options, `mobile_minimal`; `BeginFrame` flushes queued debug shapes; `RenderXREyes`; `Compose(cmd, Game/EditorOnly/XRMirror)` with `OnPreCompose`/`OnCompose`; the ImGui GPU backend). `detroit::Active()` gives Detroit-only code the concrete renderer; `detroit::Native(TextureObject)` the `wi::graphics::Texture`. Created with the app, `render::Install`ed in Initialize after the device. |
 | `devui.cpp`, `devui/` | **DevUI** — developer tooling, not game UI: menu bar, backlog, graphics settings, hierarchy/properties, scene manager, About. Gated by `AppConfig::devUI`. |
@@ -86,12 +89,6 @@ library) because each app needs its own generated `version.h` and `AppConfig`.
 | `input/InputSystem.*` | Owns the `Registry` (`Actions()`), the ImGui/editor device gating, and SDL relative-mouse ownership. Also still carries the ORIGINAL flat keymap (`Down("Sprint")`, `Axis("MoveX")`, `MoveVector()`) unchanged, for the scenes written against it. |
 | `crash/CrashHandler.*` | sentry-native + Crashpad, offline only; launches `SimtaryCrashReporter`. |
 | `render/LensFlare.*` | Procedural screen-space flare (`assets/shaders/StLensFlare*`). Hidden by whatever stands in front of the sun: the vertex shader takes nine taps of the render path's depth copy at the sun's screen position and the fraction that is still sky fades the whole flare. |
-| `render/Projector.*` | `st::Projector` + `st::ProjectorSystem` — SQUARE (or rect/ellipse/rounded) image projection with projector optics: throw ratio, aspect, lens shift, keystone, barrel/pincushion, edge softness, vignette, plus a rectangular volumetric beam. `opticBounces` reflects the image off `st::Mirror` and images it through `st::Lens` by uploading a virtual projector clipped to that element's aperture. Runs as a `RenderPath3D` custom post process (`assets/shaders/StProjectorCS.hlsl`), plus one depth-only pass per shadow-casting projector (`RenderShadows()`, driven from `st::App::Render()` BEFORE the render path so the command list is recorded ahead of the pass that samples it). Reach it anywhere via `st::ProjectorSystem::Get()`. |
-| `render/ProjectorComponent.cpp` | The `"Projector"` NATIVE COMPONENT — attach `st::Projector` to a spot light from the editor (`NCI_0 = "Projector"`, optics as `NCA_0_*` args). Follows its own entity, takes the image off it (video / camera render / material base colour, pinned with `NCA_0_imageSource`), and zeroes that light by default since the light IS the circle. |
-| `render/Laser.*` | `st::Laser` + `st::LaserSystem` — traced laser beams. Millimetre-thin core plus a wide halo, both integrated ANALYTICALLY per pixel (`assets/shaders/StLaserCS.hlsl`) rather than ray marched. Walks the beam through the optics below and stops it on the first surface `st::Raycast` reports, so one laser can be several straight legs. The impact spot leaves a fading persistence trail, which is what makes a moving beam draw a line instead of blinking a dot. `LaserArray` turns one laser into a grid/ring/fan/cross/spiral of rays (off by default — each ray is a full trace). `st::LaserSystem::Get().Path(id)->hit` is what the beam is on. |
-| `render/LaserComponent.cpp` | The `"sticLaser"` NATIVE COMPONENT. Follows its own entity; picks up a sibling `"sticRay"` (mode/range/axis) every frame instead of casting a second time. |
-| `render/Optics.*` | `st::Mirror` + `st::Lens` + `st::OpticsSystem` — flat apertures a beam reflects off (`d' = d - 2(d·n)n`) or bends through. `Lens::Type` covers Spherical / Cylindrical / Toric / Aspheric / Axicon / Prism / Window, all one paraxial ray transfer with a different deviation term. `Mirror::dichroic` splits the beam in two (reflect one band, transmit the rest), which is why `Trace()` walks a stack of branches rather than a single chain. `Trace()` is the sequential walk that turns one ray into a list of legs; it lives on the CPU because leg N+1 depends on where leg N landed, which a per-pixel pass cannot discover. Draws nothing, and carries its own “is a beam reaching me” diagnostics because a silent element is otherwise undebuggable. |
-| `render/OpticsComponents.cpp` | The `"sticMirror"` / `"sticLens"` native components. |
 | `scene/Ray.*` | `st::Raycast` / `st::RayHit` / `st::RayQuery` — one raycast over either backend: `Mesh` (`Scene::Intersects`, hits anything drawn, no body needed), `Physics` (`wi::physics::Intersects`, Jolt bodies only), `Both` (nearer wins) or `None`. Also `st::LocalAxes` — the ONE forward-axis table, shared by the projector, laser, ray and optics. |
 | `scene/DayNight.*` | `st::DayNight` - the daylight / time-of-day system. One clock drives one directional light plus the scene's weather: the sun's arc, its colour and intensity, the ambient level, the stars and the sky exposure. The sun is placed ASTRONOMICALLY by default (NOAA solar position from latitude, longitude, time zone and day of year), so it rises in the east and the day is the right length for the place and season; `geographic` off falls back to the simple overhead hoop a hand-rolled cycle usually is. `AppConfig::dayNight` (Off / Adopt / Create) decides what a scene load binds it to. Reach it anywhere via `st::DayNight::Get()`, panel in `Simtary > Day / Night & Weather`. It also owns the WEATHER: `WeatherState` is the continuous half (cloudiness, cloud darkness, fog density/start/band, wind speed/heading/turbulence, rain, exposure and ambient scaling) and seven named `WeatherPreset`s expand into it. `SetWeather(preset)` eases from what is on screen into the new state over `transitionSeconds`; `Weather()` is what the scene is showing this frame and is what gameplay should read. `autoWeather` re-rolls a preset every `autoIntervalHours` of GAME time from a seeded LCG, so the same seed gives the same weather everywhere. |
 | `scene/SceneSnapshot.*` | **Edit / Play mode (Unity's).** `PlayControl` carries the mode: in **Edit** the scene is drawn but nothing runs - `SceneManager::Update(dt, editing)` skips the scene class's `Update()` and calls `StepSceneFrozen` (1e-6 s step, physics off, scripts/animations/sounds/videos paused for the call; a scene only ever updated at dt = 0 draws no meshes), and `nativeComponents.lifecycleEnabled = false` (instances built for the inspector, never started). **Play** (`Play()`/`Step()` from Edit, F5 with the editor open) takes a `SceneSnapshot` - every entity in its own archive, ids kept, ~8 ms / 6 MB for Scene1. **Stop** restores it as a diff: play-made entities removed, each captured entity re-serialized and byte-compared, only changed ones read back (unchanged meshes are never rebuilt), all native instances destroyed, physics reset, day/night clock restored, pools forgotten, Taipan VM shut down (Unity's domain reload: module globals reset; `Time.time` is `PlayControl::SceneTime`, 0 at Play). Terrain is excluded both ways (kept like Unity's TerrainData). Transitions are applied by `App::ApplyPlayModeTransition` at the top of a frame. A game launched playing has no snapshot: Stop reloads the scene file into Edit. `--edit` (dev build) opens in the editor in Edit mode; closing the editor in Edit mode presses Play. The editor keeps a separate undo history per mode, refuses Save in Play mode, frames the viewport orange while playing; pools work only in Play. Bridge: `play {state: play|stop|...}`, `ping.mode`. |
@@ -643,8 +640,9 @@ shifts, the descriptor set numbers - comes from `wi::shadercompiler` itself, per
 built out of `GraphicsDevice_Vulkan`'s own constants; CMake used to carry a hand-written
 copy of them that could drift. Runtime compilation is not a fallback here:
 `dxcompiler.dll` is not shipped next to the exe, so `wi::renderer::LoadShader` can only
-ever load a `.cso` that the build already produced. `StProjectorCS.hlsl` and
-`StLaserCS.hlsl` are the shaders in this category.
+ever load a `.cso` that the build already produced. Extensions add theirs
+with `stratary_define_extension(ENGINE_SHADERS cs_6_0:<file> ...)` - Simtary's `StProjectorCS`
+and `StLaserCS` are the shaders in this category.
 
 **Framework shaders are compiled by `stshaderc`, not by `dxc.exe`, and on Windows they
 are compiled TWICE.** Twice because a Windows build can start on either backend, so
@@ -658,27 +656,6 @@ has both, and is what the engine's own shaders already go through. It links the 
 so its runtime DLLs are staged beside it and its build steps run from its own directory
 - on Linux `wi::shadercompiler` loads `./libdxcompiler.so`, which is relative to the
 working directory rather than to the executable.
-
-**Why the projector is not a `LightComponent`.** `light_spot()` in
-`Engine/shaders/lightingHF.hlsli` clips to a circular cone, so a mask texture, a
-video or a camera render on a spot light always lands as a CIRCLE with the image
-cropped inside it. Squaring that means changing the cone test in the engine core
-repo. `st::ProjectorSystem` gets the same picture without touching `Engine/`, at the
-cost of being screen space: no shadow map (there is a screen-space approximation), no
-lighting of transparent surfaces, no contribution to reflections or GI. Note also
-that a spot light projects along its entity's local **-Y** (see `SHCAM::init` in
-`wiRenderer.cpp`) while `LightComponent::direction` stores the opposite vector —
-`Projector::Forward::MinusY` is the setting that matches a spot light.
-
-**The projector renders its own shadow map, and it has to.** Without one the image
-passes through walls: it is a screen-space pass, so the only depth it can otherwise
-consult is the CAMERA's, which says nothing about what stands between the lens and a
-lit point. `ProjectorSystem::RenderShadows()` builds a `CameraComponent` from the
-projector frustum, runs `wi::renderer::UpdateVisibility` + `DrawScene(RENDERPASS_SHADOW)`
-into a D16 depth map, and the shader compares against it (reverse-Z, 2x2 PCF). The
-gate matrix comes from that same CameraComponent, so the two can never drift apart.
-`Projector::occlusion` is the old screen-space march, kept only as the fallback when
-`shadows` is off — it cannot see a blocker the camera does not render.
 
 **The lens flare is occluded on the GPU, in the VERTEX shader, and both halves of that
 matter.** A flare is light that reached the LENS, so it must not survive the object
@@ -697,88 +674,6 @@ chain reads it from compute - so `Draw()` brackets itself with a barrier to
 `SHADER_RESOURCE` and back; a graphics-stage read of it is a different state on DX12.
 `settings.depthOcclusion` off restores the old draw-over-everything behaviour, and with no
 depth texture passed the shader never touches `t0` at all.
-
-**A mirror has to WIN the tie against its own mesh, and the test is OWNERSHIP, not
-distance.** `st::Mirror` is a bare plane; what makes it visible is a mesh in the same
-place, on the same entity. Comparing their two distances compares ray-vs-triangle
-against ray-vs-plane, which disagree by however far the mesh surface sits from its own
-origin — a hair for a flat plane, centimetres for a mirror in a frame — and the sign of
-that difference decides whether the beam bounces or stops dead. So `Trace()` asks
-instead: is the geometry hit on this element's OWN `followEntity`? If so, and the ray
-also crosses the aperture, the element wins outright at any distance. `opticBias`
-(2 cm) is only the fallback for an element whose glass belongs to a different entity.
-The aperture still bounds it — a beam landing on the mesh OUTSIDE the aperture
-correctly stops there, and `OpticSurface`'s diagnostics (`hitsThisFrame`,
-`lastMissMargin`) say which of the two happened.
-
-**A mirror with THICKNESS reflects inside itself unless two things are handled.** The
-symptom is unmistakable and misleading: the beam hits, a spot appears on the glass, no
-beam comes off it, and flattening the mesh to zero scale on the normal axis makes it
-work. Both causes are the same mistake in different places - the reflective surface is
-the mesh's FACE, not its middle:
-
-1. `fitToMesh` puts the plane on the front face (`centre + normal * halfThickness`),
-   not the mesh centre. At the centre the outgoing beam is born inside the solid.
-2. The leg leaving an element sets `query.ignoreEntity` to that element's own
-   `followEntity`, so it cannot stop on the glass it just bounced off. Only the leg
-   immediately after the bounce is exempt, so the beam can still stop on that mesh
-   later in its path.
-
-Point the normal axis OUT of the reflective face. A double-sided mirror with real
-thickness is ambiguous by nature; (2) is what keeps the back side usable.
-
-**Optical elements are never latched off by a bad frame.** `OpticSurface::resolved` is
-separate from `enabled` for that reason: a frame in which `followEntity` has no
-transform (mid-load, mid-reload) skips the element for that frame only. Folding it into
-`enabled` made a mirror that had one such frame dead forever, and indistinguishable in
-the inspector from one that simply refuses to work.
-
-**A dichroic mirror is why the tracer is a stack, not a loop.** `Mirror::dichroic`
-reflects `tint * reflectance` and passes `transmitTint * transmittance` on as a SECOND
-beam, so one ray in becomes two out - which a linear walk cannot express.
-`OpticsSystem::Trace` keeps a `pending` stack of branches and runs them depth first,
-deliberately: the reflected chain finishes before the transmitted half starts, so
-`terminals[0]` is the primary beam and `Path(id)->hit` still hands gameplay the beam
-the player is aiming. `BeamTraceDesc::maxSplits` caps the branching and `MAX_LEGS`
-(64) is the backstop, because splits compound - two dichroics facing each other are an
-exponential, not a loop. A 50/50 beam splitter is the same feature with both tints
-white and both coefficients at 0.5.
-
-**Array projection multiplies the trace, not the draw.** `LaserArray` turns one laser
-into a Grid / Ring / Fan / Cross / Spiral of rays, each a full trace through the same
-optics, so a pattern pointed at a mirror reflects as a pattern. `spreadAngle` and
-`offset` are different instruments and both exist on purpose: angle is a dot projector
-(the pattern grows with distance), offset is a lenslet array (it does not). Trails are
-per RAY, so `trailMax` is per ray too and a 5x5 grid asks for 25x the dot budget. The
-GPU side is affordable only because both shader loops reject on a squared distance
-before reaching any `atan` - without that early-out 128 segments is two transcendentals
-per segment per pixel.
-
-**A projector reflects by standing a VIRTUAL projector behind the glass.** A projector
-is a cone, not a ray, so it cannot use the beam tracer. `Projector::opticBounces`
-instead uploads one extra `StProjector` per element: for a mirror, the apex and both
-orientation vectors reflected through the plane (the handedness flips, which is correct
-- a projected image in a mirror IS mirror-writing); for a lens, the apex moved to where
-the thin lens images it, which zooms and shifts the picture the way a real zoom lens
-does. Each virtual projector is clipped to its element's aperture in the shader
-(`projector_aperture`), without which the cone would light the whole room from inside a
-wall. It is ONE level deep by design - a virtual projector does not itself reflect - so
-two facing mirrors give two images, not an infinite corridor. Every element the image
-reaches costs another `ST_PROJECTOR_MAX` slot and another shadow map, which is why the
-default is 0.
-
-**Optics update BEFORE anything that reflects through them.** `st::App::Update` runs
-`optics_` then `projectors_` then `lasers_`. Reversing it lags every reflection by a
-frame, which reads as the reflection sliding around on its own.
-
-**Every lens type is one ray transfer with a different deviation term.** `Lens::Type`
-is Spherical / Cylindrical / Toric / Aspheric / Axicon / Prism / Window, and all of
-them are `slope' = slope - f(u, v)` in the aperture's own axes. That is the whole model,
-so a Fresnel lens is Spherical (only its appearance differs) and plano-convex vs
-biconvex is just a different focal length. What it structurally cannot do: chromatic
-dispersion (a leg carries one colour), thick-lens and TIR (elements are infinitely
-thin), and anything that turns one beam into many — lenslet arrays, gratings, a beam
-splitter's transmitted half. The tracer carries a single ray per leg by construction.
 
 **Forward-axis numbering is append-only.** `0 +Z, 1 -Z, 2 -Y, 3 +Y, 4 +X, 5 -X`, in
 `st::LocalAxes` (`Framework/scene/Ray.h`). X was appended rather than inserted where it
@@ -1261,8 +1156,8 @@ category; `ST_REGISTER_FRAMEWORK_COMPONENT(_AS)(TYPE, NAME, CATEGORY)` — and t
 puts it under **[ST] Framework** in that category;
 `ST_REGISTER_NATIVE_COMPONENT_IN(TYPE, NAME, GROUP, TAG, CATEGORY)` invents any other
 section a game wants. The framework's categories are **Audio** (emitter, collector,
-speaker, microphone, geometry/wall/room), **Optical** (laser, mirror, lens, projector)
-and **Scene** (ray, day/night).
+speaker, microphone, geometry/wall/room) and **Scene** (ray, day/night); Simtary adds
+**Optical** (laser, mirror, lens, projector).
 
 Only Project is open by default; categories inside an opened group are open but
 collapsible; typing in the search box forces open exactly the sections and categories

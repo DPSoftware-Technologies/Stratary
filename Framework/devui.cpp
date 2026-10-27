@@ -337,7 +337,7 @@ void st::App::DevUIRender() {
 
     if (showBackLog) backlogViewer.render(&showBackLog);
     if (showImguiDemo) ImGui::ShowDemoWindow(&showImguiDemo);
-    if (showGraphicsSettings) Graphics().render(&showGraphicsSettings, GamePath(), *this, LensFlare(), displaySettings_, Projectors(), Lasers(), optics_);
+    if (showGraphicsSettings) Graphics().render(&showGraphicsSettings, GamePath(), *this, LensFlare(), displaySettings_);
     if (showAbout) DevUIAbout(&showAbout);
     if (showSceneManager) DevUISceneManager();
     if (showDayNight) DevUIDayNight();

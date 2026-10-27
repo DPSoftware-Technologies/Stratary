@@ -67,7 +67,7 @@
 namespace wi::scene { struct Scene; }
 class GraphicsSettings; // Framework/devui/imgraphicsettings.h, global namespace
 
-namespace st { class ProjectorRenderPath; } // Framework/render/Projector.h
+namespace st { class GameRenderPath; } // Framework/render/GameRenderPath.h
 
 namespace st {
 
@@ -389,7 +389,7 @@ private:
     const wi::RenderPath3D* gamePath_ = nullptr;
     // Same object, typed, for the Game Viewport's resolution override. Held so SetEnabled
     // and Shutdown can clear the override without an App& to hand.
-    ProjectorRenderPath* gameRenderPath_ = nullptr;
+    GameRenderPath* gameRenderPath_ = nullptr;
     // Bring one editor-owned path in line with the game's renderer, or (preview off) back
     // to RenderPath3D's own defaults - the path object is reused, not rebuilt, so the
     // second half has to be spelled out or MirrorTo's writes would simply stick.
@@ -397,7 +397,7 @@ private:
 
     // game viewport resolution
     // "Free Aspect" (fixed == false) is the shipping behaviour: the game path follows the
-    // window canvas. Anything else forces st::ProjectorRenderPath::forcedResolution, and
+    // window canvas. Anything else forces st::GameRenderPath::forcedResolution, and
     // the Game Viewport letterboxes the result into whatever shape the dock gives it.
     struct GameViewResolution {
         bool fixed  = false;

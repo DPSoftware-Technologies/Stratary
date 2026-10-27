@@ -324,6 +324,7 @@ function(simtary_add_app)
     set(_ext_targets "")
     set(_ext_runtime "")
     set(_ext_all_sources "")
+    set(_ext_engine_shaders "")
     foreach (_ext IN LISTS APP_EXTENSIONS)
         if (NOT TARGET StExt_${_ext})
             message(FATAL_ERROR "simtary_add_app(${APP_NAME}): extension '${_ext}' is not loaded - "
@@ -338,6 +339,10 @@ function(simtary_add_app)
         get_target_property(_ext_libs StExt_${_ext} ST_EXT_RUNTIME)
         if (_ext_libs)
             list(APPEND _ext_runtime ${_ext_libs})
+        endif()
+        get_target_property(_ext_shaders StExt_${_ext} ST_EXT_ENGINE_SHADERS)
+        if (_ext_shaders)
+            list(APPEND _ext_engine_shaders ${_ext_shaders})
         endif()
     endforeach()
 
@@ -646,7 +651,7 @@ function(simtary_add_app)
             ${SIMTARY_FRAMEWORK_DIR}    # stApp.h, stRun.h, io/, sysui/, input/, ...
             ${SIMTARY_ROOT}/Engine      # Simtary.h and the rest of the engine core
             ${SIMTARY_ROOT}/include     # vendored headers (faust ABI, stb_image)
-            ${SIMTARY_ROOT}/assets/shaders  # shader interop headers shared with C++ (StProjectorInterop.h, StLaserInterop.h)
+            ${SIMTARY_ROOT}/assets/shaders  # shader interop headers shared with C++
             ${APP_SOURCE_DIR}           # the project's own scenes/ + components/
             ${_gendir}                  # generated version.h
             ${APP_EXTRA_INCLUDES}
@@ -859,13 +864,17 @@ function(simtary_add_app)
     simtary_compile_shader(TARGET ${APP_NAME} PROFILE vs_6_0 SOURCE ${SIMTARY_ROOT}/assets/shaders/StLensFlareVS.hlsl)
     simtary_compile_shader(TARGET ${APP_NAME} PROFILE ps_6_0 SOURCE ${SIMTARY_ROOT}/assets/shaders/StLensFlarePS.hlsl)
 
-    # ENGINE_ENV: unlike the shaders above, these run inside the engine's frame - they
-    # read the depth buffer, the camera constants and the bindless heaps, so they
-    # include globals.hlsli and need the engine's compiler flags.
-    simtary_compile_shader(TARGET ${APP_NAME} PROFILE cs_6_0 ENGINE_ENV
-        SOURCE ${SIMTARY_ROOT}/assets/shaders/StProjectorCS.hlsl)
-    simtary_compile_shader(TARGET ${APP_NAME} PROFILE cs_6_0 ENGINE_ENV
-        SOURCE ${SIMTARY_ROOT}/assets/shaders/StLaserCS.hlsl)
+    # Extensions' ENGINE_SHADERS (Simtary: StProjectorCS, StLaserCS). ENGINE_ENV: unlike the
+    # shaders above, these run inside the engine's frame - they read the depth buffer, the
+    # camera constants and the bindless heaps, so they include globals.hlsli and need the
+    # engine's compiler flags.
+    foreach (_entry IN LISTS _ext_engine_shaders)
+        string(FIND "${_entry}" ":" _colon)
+        string(SUBSTRING "${_entry}" 0 ${_colon} _profile)
+        math(EXPR _colon "${_colon} + 1")
+        string(SUBSTRING "${_entry}" ${_colon} -1 _source)
+        simtary_compile_shader(TARGET ${APP_NAME} PROFILE ${_profile} ENGINE_ENV SOURCE ${_source})
+    endforeach()
 
     # engine shader sources + shared compiled cache
     # The engine compiles its ~360 HLSL shaders on first launch and caches the DXIL

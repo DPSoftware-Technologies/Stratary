@@ -1,5 +1,6 @@
 #include "imgraphicsettings.h"
 #include "io/SettingsManager.h"
+#include "stAppSystem.h"
 
 bool GraphicsSettings::EngineGfx::operator==(const EngineGfx& o) const {
     return ao == o.ao && aoRange == o.aoRange && aoSampleCount == o.aoSampleCount
@@ -611,8 +612,7 @@ void GraphicsSettings::drawDisplayTab(st::DisplaySettings& display, wi::Applicat
     display.GUI(app);
 }
 
-void GraphicsSettings::drawContentTab(st::LensFlare& lensFlare, st::ProjectorSystem& projectors,
-                                      st::LaserSystem& lasers, st::OpticsSystem& optics) {
+void GraphicsSettings::drawContentTab(st::LensFlare& lensFlare) {
     // Applies live - Apply/Reset at the bottom of the window only govern the Engine
     // tab's snapshot, so say so rather than let the buttons imply otherwise.
     ImGui::TextDisabled("Applies immediately (Apply/Reset only affect the Engine tab).");
@@ -626,34 +626,18 @@ void GraphicsSettings::drawContentTab(st::LensFlare& lensFlare, st::ProjectorSys
         lensFlare.GUI();
     }
 
-    if (ImGui::CollapsingHeader("Projectors", ImGuiTreeNodeFlags_DefaultOpen)) {
-        // Square/rectangular image projection (assets/shaders/StProjectorCS.hlsl).
-        // The list itself is scene content - this only edits what is registered.
-        ImGui::TextDisabled("Framework projectors: square light projection with projector optics.");
-        ImGui::Spacing();
-        projectors.GUI();
-    }
-
-    if (ImGui::CollapsingHeader("Lasers", ImGuiTreeNodeFlags_DefaultOpen)) {
-        // Traced beams (assets/shaders/StLaserCS.hlsl). Like the projectors, the list
-        // itself is scene content - this only edits what is registered.
-        ImGui::TextDisabled("Framework lasers: traced beams, impact spots and persistence trails.");
-        ImGui::Spacing();
-        lasers.GUI();
-    }
-
-    if (ImGui::CollapsingHeader("Optics (mirrors / lenses)")) {
-        // Nothing here renders; these are what bend the beams above.
-        ImGui::TextDisabled("What laser beams reflect off and refract through. Draws nothing itself.");
-        ImGui::Spacing();
-        optics.GUI();
+    // Extensions' app systems (stAppSystem.h) - Simtary's projectors, lasers and optics.
+    for (st::AppSystem* s : st::appsystems::All()) {
+        const char* label = s->Label();
+        if (label == nullptr) continue;
+        ImGui::PushID(s->Name());
+        if (ImGui::CollapsingHeader(label, ImGuiTreeNodeFlags_DefaultOpen)) s->SettingsGUI();
+        ImGui::PopID();
     }
 }
 
 void GraphicsSettings::render(bool* isopen, wi::RenderPath3D& path, wi::Application& app,
-                              st::LensFlare& lensFlare, st::DisplaySettings& display,
-                              st::ProjectorSystem& projectors, st::LaserSystem& lasers,
-                              st::OpticsSystem& optics) {
+                              st::LensFlare& lensFlare, st::DisplaySettings& display) {
     if (!initialized_) {
         readFromEngine(path, app);
         initialized_ = true;
@@ -671,7 +655,7 @@ void GraphicsSettings::render(bool* isopen, wi::RenderPath3D& path, wi::Applicat
     if (ImGui::BeginTabBar("##gfx_tabbar")) {
         if (ImGui::BeginTabItem("Display")) { drawDisplayTab(display, app); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Engine"))  { drawEngineTab();  ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Content")) { drawContentTab(lensFlare, projectors, lasers, optics); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Content")) { drawContentTab(lensFlare); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
     ImGui::EndChild();
