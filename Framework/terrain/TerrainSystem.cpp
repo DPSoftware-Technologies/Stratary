@@ -727,7 +727,7 @@ void TerrainSystem::Flush (wi::scene::Scene& scene) {
 // --------------------------------------------------------------------- query ---
 
 bool TerrainSystem::Sample (float x, float z, GroundSample& out) const {
-    if (bindings_.empty()) return false;
+    if (bindings_.empty()) return externalGround_ ? externalGround_(x, z, out) : false;
     const TerrainData& data = *bindings_.front()->data;
     out.height = data.SampleHeight(x, z);
     out.normal = data.SampleNormal(x, z);

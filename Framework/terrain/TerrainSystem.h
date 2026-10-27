@@ -177,6 +177,13 @@ public:
 
     // ground queries
     bool Sample (float x, float z, GroundSample& out) const;
+
+    // A ground that is not an authored terrain - an extension's heightfield (Simtary's
+    // geo terrain, say). Sample() asks it when no authored terrain is bound, so every
+    // ground query (stFlight, tyres) finds it. Return false outside its area. One at a
+    // time; an empty function removes it.
+    using ExternalGroundFn = std::function<bool(float x, float z, GroundSample& out)>;
+    void SetExternalGround (ExternalGroundFn fn) { externalGround_ = std::move(fn); }
     const SoilParams* Soil (uint32_t layer) const;
     bool Raycast (const XMFLOAT3& origin, const XMFLOAT3& direction, float maxDistance,
                   XMFLOAT3& hit) const;
@@ -206,6 +213,7 @@ private:
         wi::ecs::Entity chunkGroup = wi::ecs::INVALID_ENTITY; // the engine's "chunks" entity
     };
     std::vector<std::unique_ptr<Binding>> bindings_;
+    ExternalGroundFn externalGround_;
     std::string lastError_;
     bool     focus_ = false;
     XMFLOAT3 focusPosition_ = XMFLOAT3(0, 0, 0);

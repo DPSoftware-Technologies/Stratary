@@ -175,7 +175,11 @@ private:
         const XMFLOAT3 desired(target.x - std::sin(yaw) * std::cos(pitch_) * distance,
                                target.y + std::sin(pitch_) * distance,
                                target.z - std::cos(yaw) * std::cos(pitch_) * distance);
-        const float k = init_ ? std::min(1.0f, dt * follow) : 1.0f;
+        // A jump no vehicle makes in a frame (teleport, respawn, a geo world re-centre) snaps
+        //	instead of easing - eased, the camera would sweep across the whole map.
+        const float jx = desired.x - pos_.x, jy = desired.y - pos_.y, jz = desired.z - pos_.z;
+        const bool teleported = jx * jx + jy * jy + jz * jz > 500.0f * 500.0f;
+        const float k = init_ && !teleported ? std::min(1.0f, dt * follow) : 1.0f;
         pos_.x += (desired.x - pos_.x) * k;
         pos_.y += (desired.y - pos_.y) * k;
         pos_.z += (desired.z - pos_.z) * k;
