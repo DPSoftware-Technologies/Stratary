@@ -36,7 +36,7 @@ void st::App::DevUIMenuBar() {
             ImGui::EndMenu();
         }
 
-        if (ImGui::BeginMenu("Simtary")) {
+        if (ImGui::BeginMenu("Stratary")) {
             editor_.MenuItems();
             ImGui::Separator();
             if (ImGui::BeginMenu("Window")) {
@@ -291,11 +291,11 @@ void st::App::DevUIAbout(bool *show) {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Simtary")) {
+        if (ImGui::BeginTabItem("Stratary")) {
             if (st::render::TextureRef icon = st::render::Get().UI().FromResource(aboutEngineIcon))
                 ImGui::Image((ImTextureID)st::render::Get().ImGuiTexture(*icon), ImVec2((float)icon->width, (float)icon->height));
 
-            ImGui::Text("Simtary (HMMWV4)");
+            ImGui::Text("Stratary");
             ImGui::Separator();
             ImGui::Text("Version      %s", wi::version::GetVersionString());
             ImGui::Text("Descriptor   %s", wi::version::GetDescriptorString());

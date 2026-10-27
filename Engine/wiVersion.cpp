@@ -37,9 +37,9 @@ namespace wi::version
     // main engine core
     const int reborn = 4;
     // minor features, major updates, breaking compatibility changes
-    const int major = 1;
+    const int major = 2;
     // minor bug fixes, alterations, refactors, updates
-    const int minor = 3;
+    const int minor = 0;
 
     // --- Identity ---
     const std::string codename = "Detroit";      // The engine codename
@@ -157,7 +157,7 @@ namespace wi::version
     const char* GetCreditsString()
     {
         static const char* credits = R"(
-Simtary (HMMWV4)
+Stratary
 -----------
 Development by: DPSoftware Technologies
 Based on Wicked Engine by Turánszki János
