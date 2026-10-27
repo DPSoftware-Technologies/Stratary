@@ -47,6 +47,12 @@ class EosPlatform {
 public:
     static EosPlatform& Get ();
 
+    // The project's ids, set from its main() before st::Run (the EOS plugin's app system
+    // initializes the platform with them once the network session is up). Empty productId,
+    // or never called = EOS stays off.
+    void Configure (const EosConfig& config) { pending_ = config; }
+    const EosConfig& Configured () const { return pending_; }
+
     // productName / productVersion are what the SDK reports to Epic.
     void Initialize (const EosConfig& config, const std::string& productName, const std::string& productVersion);
     void Update ();
@@ -67,6 +73,7 @@ private:
     friend struct EosLoginFlow;   // the SDK's Connect callbacks (EosPlatform.cpp)
     void RegisterBridge ();
 
+    EosConfig pending_;
     EosConfig config_;
     EosStatus status_;
     void* platform_ = nullptr;

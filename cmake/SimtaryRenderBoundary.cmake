@@ -105,12 +105,15 @@ set(_forbidden
     "#include[ \t]*\"render/(Laser|Projector|Optics)\\.h\""
     "(Laser|Projector|Optics)System"
     "Stl?(Laser|Projector)Interop"
+    "#include[ \t]*\"online/"
+    "SIMTARY_HAS_EOS"
+    "EosPlatform"
 )
 _st_boundary_scan("${FRAMEWORK_DIR}" "" _extension_hits)
 if (_extension_hits)
     list(JOIN _extension_hits "\n" _msg)
     message(FATAL_ERROR
-        "Stratary Framework code depending on the Simtary extension:\n${_msg}\n"
+        "Stratary Framework code depending on an extension or plugin (Simtary, plugins/*):\n${_msg}\n"
         "Stratary must build without it. Put the code in the extension and give Stratary a hook "
         "it can call instead (damage/Damage.h DamageHooks is the example).")
 endif()

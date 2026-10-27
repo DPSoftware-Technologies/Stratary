@@ -460,30 +460,6 @@ else()
     message(STATUS "Simtary: BHS not built (bhs/tools/build_bhs.ps1) - --stream disabled.")
 endif()
 
-# Epic Online Services: Epic's prebuilt C SDK, unzipped (its SDK/ folder) into deps/eos-sdk -
-# Include/, Lib/, Bin/. A plain C API, so it links straight into the exceptions-off build.
-# Absent: Framework/online compiles to a stub and a project's EOS ids do nothing. ONLINE.md.
-set(SIMTARY_EOS_DIR "${SIMTARY_DEPS_DIR}/eos-sdk" CACHE PATH "Epic Online Services C SDK (its SDK/ folder)")
-if (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(_eos_runtime "${SIMTARY_EOS_DIR}/Bin/EOSSDK-Win64-Shipping.dll")
-    set(_eos_implib  "${SIMTARY_EOS_DIR}/Lib/EOSSDK-Win64-Shipping.lib")
-elseif (UNIX AND NOT APPLE AND NOT ANDROID)
-    set(_eos_runtime "${SIMTARY_EOS_DIR}/Bin/libEOSSDK-Linux-Shipping.so")
-    set(_eos_implib  "${_eos_runtime}")
-endif()
-if (DEFINED _eos_runtime AND EXISTS "${_eos_runtime}" AND EXISTS "${SIMTARY_EOS_DIR}/Include/eos_sdk.h")
-    add_library(SimtaryEOS SHARED IMPORTED GLOBAL)
-    set_target_properties(SimtaryEOS PROPERTIES
-        IMPORTED_LOCATION "${_eos_runtime}"
-        IMPORTED_IMPLIB   "${_eos_implib}"
-        INTERFACE_INCLUDE_DIRECTORIES "${SIMTARY_EOS_DIR}/Include"
-        INTERFACE_COMPILE_DEFINITIONS "SIMTARY_HAS_EOS=1"
-    )
-    set(SIMTARY_EOS_RUNTIME "${_eos_runtime}" CACHE INTERNAL "EOS SDK runtime library")
-    message(STATUS "Simtary: EOS SDK at ${SIMTARY_EOS_DIR}")
-else()
-    message(STATUS "Simtary: EOS SDK not found (deps/eos-sdk) - online services disabled.")
-endif()
 
 # Renderers compiled in (EDITIONS.md). Detroit is the engine's own (Wicked) and always there;
 # "Hurricanes" adds the Petrol renderer on Google Filament (libs/filament, submodule pinned to a

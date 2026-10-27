@@ -16,7 +16,6 @@
 #include "xr/XRSystem.h"
 #include "net/NetSession.h"
 #include "stream/StreamHost.h"
-#include "online/EosPlatform.h"
 #include "version.h"   // generated: ST_APP_VERSION
 #include "stRun.h"
 #include "scene/FileScene.h"
@@ -424,8 +423,8 @@ void st::App::Initialize() {
     // Multiplayer (Simtary/MULTIPLAYER.md): --server[=port] / --connect=<ip>[:port], off otherwise.
     st::net::NetSession::Get().Initialize(Config().name);
 
-    // Epic Online Services (Simtary/ONLINE.md): on when the project set its ids, off otherwise.
-    st::online::EosPlatform::Get().Initialize(Config().eos, Config().name, ST_APP_VERSION);
+    // Plugins' and extensions' app systems that need the app's services up (EOS: plugins/EOS).
+    st::appsystems::StartAll(st::AppInfo{ Config().name, ST_APP_VERSION });
 
     // Streaming (Simtary/CLOUD.md): --stream, off otherwise. After the device and the window.
     st::stream::StreamHost::Get().Initialize(*this);
@@ -616,7 +615,7 @@ void st::App::Update(float dt) {
     // the main loop to the HMD from here.
     st::xr::XRSystem::Get().Update();
     st::net::NetSession::Get().Update(dt);
-    st::online::EosPlatform::Get().Update();   // every EOS callback fires in here, on this thread
+    st::appsystems::PreUpdateAll(dt);         // plugin services (EOS callbacks fire in here, on this thread)
     st::stream::StreamHost::Get().Update();   // the viewer's keys / mouse, before the scene reads input
     // Two blocking waits per frame (xrWaitFrame and the desktop present) land the frame on
     // every other headset interval, so the desktop v-sync is off while a session runs.
@@ -783,7 +782,6 @@ void st::App::Exit() {
     // The OpenXR session holds the engine's D3D12 device and queue: gone before they are.
     st::xr::XRSystem::Get().Shutdown();
     st::net::NetSession::Get().Shutdown();
-    st::online::EosPlatform::Get().Shutdown();
     st::stream::StreamHost::Get().Shutdown();
 
     // The splash's textures and audio stream, if the game is closed while it is still up.

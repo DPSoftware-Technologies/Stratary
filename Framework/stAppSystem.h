@@ -8,6 +8,11 @@
 //   Init(gamePath)    once, when the game render path exists (after the project's
 //                     OnRenderPathSetup) - load shaders, hang passes on the path
 //   LoadFrom(tag)     right after Init, from options.stad's sub-compound Name()
+//   Start(info)       once, later: the app's own services are up (graphics device, XR,
+//                     the network session) - platform services that need to know whether
+//                     this is a server start here (EOS)
+//   PreUpdate(dt)     every frame BEFORE the scene: with the network session, after the
+//                     editor bridge - callbacks that feed the scene this frame (EOS ticks)
 //   Update(scene, dt) every frame after the scene update, before the renderer's own effects,
 //                     in Order() - lower first
 //   SettingsGUI()     a section in Graphics Settings > Content (DevUI)
@@ -21,6 +26,7 @@
 
 #include "io/Nbt.h"
 
+#include <string>
 #include <vector>
 
 namespace wi::scene { struct Scene; }
@@ -28,6 +34,12 @@ namespace wi::scene { struct Scene; }
 namespace st {
 
 class GameRenderPath;
+
+// What Start() gets to know about the app.
+struct AppInfo {
+    std::string name;       // AppConfig::name
+    std::string version;    // ST_APP_VERSION
+};
 
 struct AppSystem {
     virtual ~AppSystem() = default;
@@ -39,6 +51,8 @@ struct AppSystem {
     virtual int Order () const { return 0; }
 
     virtual void Init (GameRenderPath& /*gamePath*/) {}
+    virtual void Start (const AppInfo& /*info*/) {}
+    virtual void PreUpdate (float /*dt*/) {}
     virtual void Update (wi::scene::Scene& /*scene*/, float /*dt*/) {}
     virtual void SettingsGUI () {}
     virtual void LoadFrom (const nbt::Tag& /*in*/) {}
@@ -54,6 +68,8 @@ const std::vector<AppSystem*>& All ();
 
 // What st::App and the Detroit renderer call.
 void InitAll (GameRenderPath& gamePath);
+void StartAll (const AppInfo& info);
+void PreUpdateAll (float dt);
 void UpdateAll (wi::scene::Scene& scene, float dt);
 void LoadAll ();
 void SaveAll ();

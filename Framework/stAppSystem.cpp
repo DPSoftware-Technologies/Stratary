@@ -31,6 +31,14 @@ void InitAll (GameRenderPath& gamePath) {
     for (AppSystem* s : Systems()) s->Init(gamePath);
 }
 
+void StartAll (const AppInfo& info) {
+    for (AppSystem* s : Systems()) s->Start(info);
+}
+
+void PreUpdateAll (float dt) {
+    for (AppSystem* s : Systems()) s->PreUpdate(dt);
+}
+
 void UpdateAll (wi::scene::Scene& scene, float dt) {
     for (AppSystem* s : Systems()) s->Update(scene, dt);
 }

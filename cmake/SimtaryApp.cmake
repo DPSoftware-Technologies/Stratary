@@ -15,6 +15,7 @@
 #       EXTRA_INCLUDES ...
 #       EXTRA_LIBS     ...
 #       EXTENSIONS     Simtary             # extensions added with stratary_add_extension()
+#       PLUGINS        EOS                 # Stratary's own plugins (<Stratary>/plugins/<name>)
 #       NO_SHADER_WARM                     # skip the engine shader pre-pass
 #       NO_CRASH_REPORTER                  # do not ship SimtaryCrashReporter
 #       MODULE                             # ship game code as a separate library
@@ -209,7 +210,7 @@ function(simtary_add_app)
     set(_one  NAME ORGANIZATION ICON SOURCE_DIR ASSETS_DIR CONTENT_SUBDIR SCENE_SUBDIR
               RESOURCE_SUBDIR PACK_NAME PACK_PART_SIZE PACK_LEVEL PACK_ON_CONFLICT
               MODULE_NAME)
-    set(_multi EXTRA_SOURCES EXTRA_INCLUDES EXTRA_LIBS EXTENSIONS)
+    set(_multi EXTRA_SOURCES EXTRA_INCLUDES EXTRA_LIBS EXTENSIONS PLUGINS)
     cmake_parse_arguments(APP "${_opts}" "${_one}" "${_multi}" ${ARGN})
 
     if (NOT APP_NAME)
@@ -321,6 +322,15 @@ function(simtary_add_app)
 
     # Extensions (cmake/SimtaryExtension.cmake): their sources join the framework's, their
     # usage requirements reach every compile target, their shared libraries are staged.
+    # A plugin is an extension that lives in Stratary's own plugins/ folder.
+    foreach (_plugin IN LISTS APP_PLUGINS)
+        if (NOT EXISTS "${SIMTARY_ROOT}/plugins/${_plugin}/CMakeLists.txt")
+            message(FATAL_ERROR "simtary_add_app(${APP_NAME}): no plugin '${_plugin}' in ${SIMTARY_ROOT}/plugins")
+        endif()
+        stratary_add_extension("${SIMTARY_ROOT}/plugins/${_plugin}")
+        list(APPEND APP_EXTENSIONS ${_plugin})
+    endforeach()
+
     set(_ext_targets "")
     set(_ext_runtime "")
     set(_ext_all_sources "")
@@ -641,9 +651,6 @@ function(simtary_add_app)
     endif()
     if (TARGET SimtaryBHS)
         list(APPEND _app_link_libraries SimtaryBHS)      # Framework/stream (SIMTARY_HAS_BHS)
-    endif()
-    if (TARGET SimtaryEOS)
-        list(APPEND _app_link_libraries SimtaryEOS)      # Framework/online (SIMTARY_HAS_EOS)
     endif()
 
     foreach (_target IN LISTS _compile_targets)
@@ -1016,14 +1023,6 @@ function(simtary_add_app)
                 "${SIMTARY_BHS_BIN}/bhs.dll" "${SIMTARY_BHS_BIN}/libssl-3-x64.dll" "${SIMTARY_BHS_BIN}/libcrypto-3-x64.dll"
                 $<TARGET_FILE_DIR:${APP_NAME}>
             COMMENT "Copying BHS to output directory"
-            VERBATIM
-        )
-    endif()
-    if (TARGET SimtaryEOS)
-        add_custom_command(TARGET ${APP_NAME} PRE_LINK
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${SIMTARY_EOS_RUNTIME}" $<TARGET_FILE_DIR:${APP_NAME}>
-            COMMENT "Copying EOS SDK to output directory"
             VERBATIM
         )
     endif()
