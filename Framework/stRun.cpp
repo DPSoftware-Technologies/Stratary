@@ -1,0 +1,559 @@
+#ifndef SDL_MAIN_HANDLED   // normally set by Simtary::AppFlags
+#define SDL_MAIN_HANDLED
+#endif
+#include "xr/XRSystem.h"
+#include "stream/StreamHost.h"
+#include "Simtary.h"
+#include "sdl2.h"
+#include "stRun.h"
+#include "render/api/Backend.h"
+#include "crash/CrashHandler.h"
+#include "io/UserData.h"
+#include "io/LogFormat.h"
+#include "ui/UIComponents.h"
+#include "ui/UISystem.h"
+#include "io/asset/AssetSystem.h"
+#include "input/InputSystem.h"
+#include "dev/DevBuild.h"
+#include "SubWinStatus.h"
+#include "wiBacklog.h"
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#ifndef _WIN32
+#include <cerrno>
+#include <unistd.h>
+#endif
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <pthread.h>
+#endif
+
+#ifdef _WIN32
+#include <SDL_syswm.h>
+#include <dwmapi.h>
+
+// Define fallbacks if compiling with an older Windows SDK
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+
+#ifndef DWMWCP_DONOTROUND
+#define DWMWCP_DONOTROUND 1
+#endif
+
+void DisableWindowRounding(SDL_Window* sdlWindow) {
+    SDL_SysWMinfo wmInfo;
+    SDL_VERSION(&wmInfo.version);
+
+    if (SDL_GetWindowWMInfo(sdlWindow, &wmInfo)) {
+        if (wmInfo.subsystem == SDL_SYSWM_WINDOWS) {
+            HWND hwnd = wmInfo.info.win.window;
+            DWORD preference = DWMWCP_DONOTROUND;
+
+            DwmSetWindowAttribute(
+                hwnd, 
+                (DWMWINDOWATTRIBUTE)DWMWA_WINDOW_CORNER_PREFERENCE, 
+                &preference, 
+                sizeof(preference)
+            );
+        }
+    }
+}
+#else
+void DisableWindowRounding(SDL_Window* sdlWindow) {
+    // No-op for macOS, Linux, etc.
+}
+#endif
+
+namespace st::detail { void SetActiveConfig(const AppConfig* config); }
+
+namespace {
+
+bool g_restartRequested = false;
+
+// Start this executable again with the command line it was given. Called after the
+// engine, SDL and the crash reporter have all shut down, so the new process never
+// races the old one for the window, the audio device or options.stad.
+void RelaunchSelf(int argc, char* argv[]) {
+#ifdef _WIN32
+    // GetCommandLineW rather than a rebuild from argv: it is the ORIGINAL line,
+    // quoting intact, so a path with spaces survives. CreateProcessW may write to the
+    // buffer it is handed, so it gets a copy of its own.
+    std::wstring commandLine = GetCommandLineW();
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process = {};
+    if (CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE,
+                       0, nullptr, nullptr, &startup, &process)) {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    } else {
+        printf("Restart failed (CreateProcessW error %lu)\n", GetLastError());
+    }
+#else
+    // execv REPLACES this process, so nothing below it runs unless it failed. argv is
+    // null-terminated by the standard, which is what execv wants.
+    (void)argc;
+    execv("/proc/self/exe", argv);
+    printf("Restart failed (execv: %s)\n", strerror(errno));
+#endif
+}
+
+#ifdef __ANDROID__
+// stdout/stderr go nowhere on Android. Everything the engine prints - printf, the
+// backlog's DebugOut (std::cout/cerr) - is pushed through a pipe and out to logcat
+// under the tag "Simtary", one line per entry: `adb logcat -s Simtary`.
+void RedirectStdioToLogcat() {
+    static int pipeFds[2] = { -1, -1 };
+    if (pipeFds[0] != -1) return;
+    setvbuf(stdout, nullptr, _IOLBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    if (pipe(pipeFds) != 0) return;
+    dup2(pipeFds[1], STDOUT_FILENO);
+    dup2(pipeFds[1], STDERR_FILENO);
+    pthread_t reader;
+    pthread_create(&reader, nullptr, [](void*) -> void* {
+        char buffer[1024];
+        std::string line;
+        ssize_t n;
+        while ((n = read(pipeFds[0], buffer, sizeof(buffer))) > 0) {
+            for (ssize_t i = 0; i < n; ++i) {
+                if (buffer[i] == '\n') {
+                    __android_log_write(ANDROID_LOG_INFO, "Simtary", line.c_str());
+                    line.clear();
+                } else {
+                    line += buffer[i];
+                }
+            }
+        }
+        return nullptr;
+    }, nullptr);
+    pthread_detach(reader);
+}
+
+// Every path the engine uses is relative ("assets/...", "shaders/spirv/..."), so the
+// working directory IS the install. Dev layout: the app's own external files folder
+// (/sdcard/Android/data/<package>/files), which adb can push the data into and which
+// is writable for settings, the shader cache and log.txt.
+void EnterAndroidDataFolder() {
+    const char* dir = SDL_AndroidGetExternalStoragePath();
+    if (dir == nullptr || chdir(dir) != 0)
+        printf("Android: cannot enter the data folder (%s)\n", dir ? dir : SDL_GetError());
+    else
+        printf("Android: data folder %s\n", dir);
+    // The engine's default shader path is built during static initialisation, when the
+    // working directory was still "/" - so it read "//shaders/". Re-derive it here.
+    wi::renderer::SetShaderPath(wi::helper::GetCurrentPath() + "/shaders/");
+}
+#endif
+
+} // namespace
+
+namespace { bool g_headless = false; }
+bool st::IsHeadless() { return g_headless; }
+
+void st::RequestRestart()   { g_restartRequested = true; }
+bool st::RestartRequested() { return g_restartRequested; }
+
+int st::Run(int argc, char* argv[], AppConfig& config, App& application) {
+#ifdef __ANDROID__
+    RedirectStdioToLogcat();
+    EnterAndroidDataFolder();
+#endif
+    // Command line first. It used to be parsed after SetWindow(), which is AFTER the
+    // graphics device is created - so "vulkan", "dx12", "debugdevice" and the GPU
+    // preference flags were all read from an empty argument set and did nothing.
+    wi::arguments::Parse(argc, argv);
+    // Every backlog line from here on is also printed to the process console, coloured.
+    st::log::InstallConsoleLog();
+    // The UI component managers, in every Scene from the first one on (Framework/ui).
+    st::ui::InstallUIComponents();
+    st::stream::StreamHost::Get().ParseCommandLine();   // --stream: decides the window below
+    {
+        std::string port;
+        const bool server = wi::arguments::HasArgument("--server") || wi::arguments::GetArgumentValue("--server=", port);
+        g_headless = server && !wi::arguments::HasArgument("--server-window");
+    }
+    // A server's stdout is usually a pipe (a panel, systemd, docker), and a pipe is block
+    // buffered: a crash would swallow the last few KB of log - exactly the lines that say
+    // where it died. Line buffering costs nothing at a server's log rate.
+    if (g_headless) {
+#ifdef _WIN32
+        // MSVC's CRT has no line buffering (_IOLBF means full buffering there) and rejects a
+        //	zero size as an invalid parameter - a fast-fail before the first log line. Unbuffered
+        //	is the Windows equivalent.
+        setvbuf(stdout, nullptr, _IONBF, 0);
+#else
+        setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
+        setvbuf(stderr, nullptr, _IONBF, 0);
+    }
+
+    // Then the project properties: the crash reporter, the user-data folder and
+    // App::Config() all read from here during startup.
+    // --scene=<name> starts in that scene instead of AppConfig::startupScene - for jumping
+    //	straight into a test scene, or a shortcut that opens one level.
+    for (int i = 1; i < argc; ++i) {
+        const char* prefix = "--scene=";
+        if (std::strncmp(argv[i], prefix, std::strlen(prefix)) == 0)
+            config.startupScene = argv[i] + std::strlen(prefix);
+    }
+
+    st::detail::SetActiveConfig(&config);
+    st::userdata::Configure(config.organization, config.name);
+
+    // Dev build: bring <exe>/assets up to date with the project's SOURCE assets first.
+    // It has to come before the mounts below - a mounted package is memory-mapped, which
+    // on Windows locks the very files the sync replaces. Nothing changed costs one stat
+    // per source file; the native loading window only appears when there is real work.
+    if (st::dev::IsDevBuild() && !wi::arguments::HasArgument("--no-devsync") &&
+        !wi::arguments::HasArgument("no-devsync")) {
+        const bool force = wi::arguments::HasArgument("--devsync") || wi::arguments::HasArgument("devsync");
+        SubWinStatus syncWindow(config.name, 470, 124);
+        bool windowShown = false;
+        const st::dev::SyncReport sync = st::dev::SyncAssets(force, [&](const std::string& phase) {
+            if (phase.rfind("Checking", 0) == 0) return; // the cheap part: no window for it
+            if (!windowShown) {
+                syncWindow.Show();
+                windowShown = true;
+            }
+            syncWindow.SetProgress(0);
+            syncWindow.SetStatus(phase, "dev build: assets/ changed since the last sync");
+        });
+        if (windowShown) syncWindow.Hide();
+        wi::backlog::post("Dev asset sync: " + sync.message,
+                          sync.ok ? wi::backlog::LogLevel::Default : wi::backlog::LogLevel::Error);
+    }
+
+    // Asset packages, before ANYTHING reads content. wi::helper::FileRead is the single
+    // path every engine load goes through, and installing the override here means the
+    // splash, the shader warm-up and the first scene all resolve through the packs
+    // without one of them having been special-cased. A path no pack holds falls through
+    // to the filesystem, so mounting nothing changes nothing.
+    for (const std::string& packPath : config.assetPacks) {
+        std::string packError;
+        if (st::AssetSystem::Get().Mount(packPath, config.assetMountPoint, &packError,
+                                         config.assetPacksVerify))
+            continue;
+
+        printf("Asset package %s could not be mounted: %s\n", packPath.c_str(), packError.c_str());
+        if (config.assetPacksRequired) {
+            // A shipped build with a broken install should say so at the door rather
+            // than start up and present an empty world.
+            wi::helper::messageBox("The game content could not be loaded.\n\n" + packError +
+                                   "\n\nReinstalling or verifying the game files should fix this.",
+                                   config.name + " - content error");
+            return 1;
+        }
+    }
+    if (st::AssetSystem::Get().MountCount() > 0) st::AssetSystem::Get().Install();
+
+    printf("Starting crash reporter.\n");
+    st::crash::Init(argv[0], config.name.c_str());
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--testcrash") == 0 || strcmp(argv[i], "testcrash") == 0) {
+            volatile int* p = nullptr;
+            *p = 42;
+        }
+    }
+
+    printf("Starting chassis\n");
+    // Headless: no video / audio / controller subsystems - a server box may have no display
+    // and no sound device at all. Events stay: Ctrl+C / SIGTERM arrive as SDL_QUIT.
+    sdl2::sdlsystem_ptr_t system = sdl2::make_sdlsystem(
+        g_headless ? (SDL_INIT_EVENTS | SDL_INIT_TIMER) : (SDL_INIT_EVERYTHING | SDL_INIT_EVENTS));
+
+    // Which backend this run uses - command line, then the player's saved choice, then
+    // the project default, then the platform default. Decided BEFORE the window exists
+    // because the window itself differs: SDL_WINDOW_VULKAN makes SDL load the Vulkan
+    // loader and fail window creation when there is none, so a DirectX 12 run must not
+    // ask for it. See Framework/render/GraphicsAPI.h.
+    const st::GraphicsAPI graphicsAPI = st::ResolveGraphicsAPI(config.graphicsAPI);
+    // Streaming (Framework/stream): the window is only the swapchain's host, so it is hidden and
+    // exactly the stream's size - the render path then renders at the size that is encoded.
+    const bool streamHidden = st::stream::StreamHost::Get().Requested() &&
+                              !st::stream::StreamHost::Get().GetOptions().showWindow;
+    Uint32 windowFlags = (streamHidden ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN) | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+    if (st::stream::StreamHost::Get().Requested()) {
+        windowFlags &= ~Uint32(SDL_WINDOW_ALLOW_HIGHDPI);   // 1 window pixel = 1 video pixel
+        config.windowWidth = int(st::stream::StreamHost::Get().GetOptions().width);
+        config.windowHeight = int(st::stream::StreamHost::Get().GetOptions().height);
+    }
+#ifdef __ANDROID__
+    windowFlags |= SDL_WINDOW_FULLSCREEN; // the activity's surface is the whole screen
+#endif
+    // A Hurricanes run (--renderer=hurricanes) gives the window to Filament, not to Wicked's
+    // device, so it is a plain window whatever the saved backend says.
+    const bool hurricanes = st::render::ChosenBackend() == st::render::Backend::Hurricanes;
+    if (graphicsAPI == st::GraphicsAPI::Vulkan && !hurricanes)
+        windowFlags |= SDL_WINDOW_VULKAN;
+
+    sdl2::window_ptr_t window = g_headless ? sdl2::window_ptr_t(nullptr, SDL_DestroyWindow) : sdl2::make_window(
+            config.name.c_str(),
+            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+            config.windowWidth, config.windowHeight,
+            windowFlags);
+    if (window) {
+        DisableWindowRounding(window.get());
+    }
+    // Splash screen. Optional: a project with no splashImage (or a missing file)
+    // just gets a blank window until the graphics device comes up.
+#ifdef __ANDROID__
+    // No software splash: an SDL_Renderer on the activity's surface would have to be
+    // torn down before Vulkan can take the same ANativeWindow.
+    const bool showSplash = false;
+#else
+    const bool showSplash = !config.splashImage.empty() && !g_headless && !streamHidden;
+#endif
+    if (showSplash) {
+        // SOFTWARE renderer - Vulkan ain't active yet, use this!
+        SDL_Renderer* splashRenderer = SDL_CreateRenderer(window.get(), -1, SDL_RENDERER_SOFTWARE);
+        if (splashRenderer) {
+            // SDL reads the filesystem directly, so it does not see the asset source
+            // override the engine uses. A packed-only build would otherwise lose its
+            // splash, which is the first thing anyone notices.
+            SDL_Surface* splashSurface = SDL_LoadBMP(config.splashImage.c_str()); // BMP = no extra lib needed
+            std::vector<uint8_t> splashBytes;
+            if (splashSurface == nullptr &&
+                st::AssetSystem::Get().Read(config.splashImage, splashBytes) && !splashBytes.empty()) {
+                if (SDL_RWops* rw = SDL_RWFromConstMem(splashBytes.data(), (int)splashBytes.size()))
+                    splashSurface = SDL_LoadBMP_RW(rw, 1);   // 1 = SDL closes the RWops
+            }
+            SDL_Texture* splashTexture = splashSurface
+                ? SDL_CreateTextureFromSurface(splashRenderer, splashSurface)
+                : nullptr;
+            if (splashSurface) SDL_FreeSurface(splashSurface);
+
+            if (splashTexture) {
+                int winW, winH, imgW, imgH;
+                SDL_GetWindowSize(window.get(), &winW, &winH);
+                SDL_QueryTexture(splashTexture, NULL, NULL, &imgW, &imgH);
+
+                // CENTER MATH - NO EXCUSES!
+                SDL_Rect dst = {
+                    (winW - imgW) / 2,
+                    (winH - imgH) / 2,
+                    imgW, imgH
+                };
+
+                SDL_RenderClear(splashRenderer);
+                SDL_RenderCopy(splashRenderer, splashTexture, NULL, &dst);
+                SDL_RenderPresent(splashRenderer);
+
+                // Cleanup splash before Vulkan takes over
+                SDL_DestroyTexture(splashTexture);
+            }
+            SDL_DestroyRenderer(splashRenderer);
+        }
+    }
+
+    printf("Starting Engine.\n");
+    // The device is created here rather than left to Application::SetWindow, which is
+    // the seam the engine documents for it ("User can also create a graphics device if
+    // custom logic is desired, but they must do before this function!"). SetWindow only
+    // builds one when none exists, so it takes ours and appends nothing to the shader
+    // path - st::CreateGraphicsDevice already pointed it at shaders/hlsl6 or
+    // shaders/spirv to match.
+    if (g_headless) {
+        application.CreateHeadlessDevice();
+        application.SetHeadless(1280, 720);
+        printf("Headless: no window, null graphics device\n");
+    } else if (hurricanes) {
+        // Wicked runs everything but drawing on the null device, as the headless server does;
+        // the Hurricanes renderer (Filament) takes the real GPU on this window in App::Initialize.
+        application.CreateHeadlessDevice();
+        application.SetWindow(window.get());
+        printf("Hurricanes: Wicked on the null device, Filament draws\n");
+    } else {
+        application.CreateGraphicsDevice(graphicsAPI, window.get());
+        application.SetWindow(window.get());
+    }
+    printf("Starting Engine..\n");
+
+    // application.infoDisplay.active = true;
+    // application.infoDisplay.watermark = true;
+    // application.infoDisplay.resolution = true;
+    // application.infoDisplay.fpsinfo = true;
+
+    printf("Starting Engine...\n");
+    application.Initialize();
+
+    bool quit = false;
+    printf("Starting Engine....\n");
+    while (!quit && !g_restartRequested) {
+        SDL_PumpEvents();
+        application.Run();
+        // After the frame was submitted: hand the headset its eye images (Framework/xr).
+        st::xr::XRSystem::Get().EndFrame();
+
+        SDL_Event event;
+
+        if (g_headless) {
+            // Nothing is drawn, so nothing paces the loop - hold it to 60 Hz instead of
+            // spinning a core. The server's simulation and snapshots run on top of this.
+            static Uint64 next = SDL_GetPerformanceCounter();
+            const Uint64 freq = SDL_GetPerformanceFrequency();
+            next += freq / 60;
+            const Uint64 now = SDL_GetPerformanceCounter();
+            if (next > now) SDL_Delay(Uint32((next - now) * 1000 / freq));
+            else next = now;   // fell behind: do not try to catch up in a burst
+        } else {
+            SDL_SetWindowTitle(window.get(), ((config.name + " - ") + application.infowatermark_str).c_str());
+        }
+        while (SDL_PollEvent(&event)) {
+            // Startup splash (st::App::SplashBlocksInput): the world under it is not ready
+            // to be played, so input reaches neither ImGui nor the game. A press ends a
+            // skippable video; the wait for the world after it is never skipped.
+            if (application.SplashBlocksInput()) {
+                bool isInput = false, isPress = false;
+                switch (event.type) {
+                    case SDL_KEYDOWN:
+                        isInput = true;
+                        isPress = event.key.repeat == 0;
+                        break;
+                    case SDL_MOUSEBUTTONDOWN: case SDL_CONTROLLERBUTTONDOWN:
+                    case SDL_JOYBUTTONDOWN: case SDL_FINGERDOWN:
+                        isInput = isPress = true;
+                        break;
+                    case SDL_KEYUP: case SDL_TEXTINPUT: case SDL_TEXTEDITING:
+                    case SDL_MOUSEMOTION: case SDL_MOUSEBUTTONUP: case SDL_MOUSEWHEEL:
+                    case SDL_CONTROLLERBUTTONUP: case SDL_CONTROLLERAXISMOTION:
+                    case SDL_JOYBUTTONUP: case SDL_JOYAXISMOTION:
+                    case SDL_FINGERUP: case SDL_FINGERMOTION:
+                        isInput = true;
+                        break;
+                    default:
+                        break;
+                }
+                if (isInput) {
+                    if (isPress && application.SplashSkippable()) application.SkipSplashVideo();
+                    continue;
+                }
+            }
+
+            if (!g_headless) ImGui_ImplSDL2_ProcessEvent(&event);
+            const ImGuiIO& io = ImGui::GetIO();
+
+            switch (event.type) {
+                case SDL_QUIT:
+                    quit = true;
+                    break;
+                case SDL_WINDOWEVENT:
+                    switch (event.window.event) {
+                        case SDL_WINDOWEVENT_CLOSE:
+                            quit = true;
+                            break;
+                        case SDL_WINDOWEVENT_RESIZED:
+                            application.SetWindow(application.window);
+                            break;
+                        default:
+                            break;
+                    }
+                    break;
+                default:
+                    break;
+            }
+
+            // Any genuine input resets the idle standby timer. Done before the
+            // ImGui-capture guard below, so typing into a DevUI window still counts
+            // as the player being present.
+            switch (event.type) {
+                case SDL_KEYDOWN: case SDL_KEYUP: case SDL_TEXTINPUT:
+                case SDL_MOUSEMOTION: case SDL_MOUSEBUTTONDOWN:
+                case SDL_MOUSEBUTTONUP: case SDL_MOUSEWHEEL:
+                case SDL_CONTROLLERBUTTONDOWN: case SDL_CONTROLLERBUTTONUP:
+                case SDL_CONTROLLERAXISMOTION:
+                case SDL_JOYBUTTONDOWN: case SDL_JOYAXISMOTION:
+                case SDL_FINGERDOWN: case SDL_FINGERMOTION:
+                    application.Display().NotifyActivity();
+                    break;
+                default:
+                    break;
+            }
+
+            // Files dropped onto the window. Handled here rather than left to the generic
+            // hook below for two reasons: SDL allocates event.drop.file and the receiver
+            // owns it, so the free has to happen on every path; and the capture guard
+            // further down only filters pointer and key events, so a drop would sail past
+            // it either way. The project gets first refusal through OnEvent, then the
+            // DevUI Asset Explorer.
+            if (event.type == SDL_DROPFILE || event.type == SDL_DROPTEXT) {
+                if (event.drop.file != nullptr) {
+                    if (event.type == SDL_DROPFILE && !application.OnEvent(event))
+                        application.HandleDroppedFile(event.drop.file);
+                    SDL_free(event.drop.file);
+                }
+                continue;
+            }
+
+            // A text field in a game UI document has focus: its keys and text are its own.
+            if ((event.type == SDL_KEYDOWN || event.type == SDL_KEYUP || event.type == SDL_TEXTINPUT)
+                && st::ui::UISystem::Get().WantsKeyboard()
+                && st::ui::UISystem::Get().HandleSdlEvent(event))
+                continue;
+
+            // Developer-tooling toggle. Checked before the capture guard below, not just
+            // before the project hook: with an editor panel focused the guard swallows every
+            // key, and the one key that brings the tooling back has to survive that. Only a
+            // live text field outranks it.
+            if (config.devUIToggleKey != 0
+                && event.type == SDL_KEYDOWN
+                && event.key.repeat == 0
+                && !io.WantTextInput
+                && event.key.keysym.scancode == (SDL_Scancode)config.devUIToggleKey) {
+                application.ToggleDevUI();
+                continue;
+            }
+
+            // Don't forward pointer/keyboard events to the engine when the UI owns them.
+            //
+            // Two owners: ImGui's own WantCapture* (the pointer is over a panel, a text field
+            // has the keyboard), and st::InputSystem's UI input capture, which Editor mode
+            // raises whenever the Game Viewport is not the focused panel. The second exists
+            // because a merely focused ImGui window does NOT set WantCaptureKeyboard, so
+            // without it WASD typed at the editor viewport still drove the game camera.
+            const bool uiOwnsInput = st::InputSystem::Get().IsUIInputCaptured();
+
+            // Releases are never swallowed. Dropping a KEYUP would leave wi::input believing
+            // the key is still held once focus moves away mid-press - a camera that flies off
+            // forever - so only the press side is filtered.
+            const bool isRelease = event.type == SDL_KEYUP
+                                || event.type == SDL_MOUSEBUTTONUP;
+            const bool isPointer = event.type == SDL_MOUSEMOTION
+                                || event.type == SDL_MOUSEBUTTONDOWN
+                                || event.type == SDL_MOUSEWHEEL;
+            const bool isKey = event.type == SDL_KEYDOWN
+                             || event.type == SDL_TEXTINPUT;
+            if (!isRelease
+                && ((isPointer && (io.WantCaptureMouse || uiOwnsInput))
+                 || (isKey && (io.WantCaptureKeyboard || uiOwnsInput))))
+                continue;
+
+            // Project hook: raw SDL, before the engine. Returning true consumes it.
+            if (application.OnEvent(event))
+                continue;
+
+            wi::input::sdlinput::ProcessEvent(event);
+        }
+    }
+    printf("Stopping Content\n");
+    application.Exit();
+    printf("Stopping Engine\n");
+    wi::jobsystem::ShutDown();
+    printf("Stopping chassis\n");
+    SDL_Quit();
+    printf("Stopping crash reporter \n");
+    st::crash::Shutdown();
+    printf("Stopped\n");
+
+    if (g_restartRequested) {
+        printf("Restarting\n");
+        RelaunchSelf(argc, argv);
+    }
+    return 0;
+}

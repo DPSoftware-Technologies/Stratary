@@ -1,0 +1,1417 @@
+# SimtaryApp.cmake - simtary_add_app(): turn a project directory into a game.
+#
+# A project's CMakeLists.txt is about ten lines; everything below is what those ten
+# lines expand to. Pulled in through cmake/SimtaryBootstrap.cmake.
+#
+#   simtary_add_app(
+#       NAME           Milistry            # target + executable name (required)
+#       ORGANIZATION   "PlatoonLabs"       # rc CompanyName / copyright holder
+#       ICON           assets/appicon.ico  # Windows .ico, optional
+#       SOURCE_DIR     src                 # default: <project>/src
+#       ASSETS_DIR     assets              # default: <project>/assets
+#       CONTENT_SUBDIR contents            # <assets>/<sub> lands in <exe>/assets
+#       SCENE_SUBDIR   scenes              # <assets>/<sub> holds the .wiscene SOURCES
+#       EXTRA_SOURCES  ...                 # sources outside SOURCE_DIR
+#       EXTRA_INCLUDES ...
+#       EXTRA_LIBS     ...
+#       EXTENSIONS     Simtary             # extensions added with stratary_add_extension()
+#       NO_SHADER_WARM                     # skip the engine shader pre-pass
+#       NO_CRASH_REPORTER                  # do not ship SimtaryCrashReporter
+#       MODULE                             # ship game code as a separate library
+#       MODULE_NAME    application         # its file name; default "application"
+#   )
+#
+# The framework (Simtary/Framework) is compiled INTO the app rather than linked as a
+# shared static library: each app gets its own generated version.h (build counter,
+# version, date) and its own AppConfig, so the objects are genuinely per-project.
+#
+# MODULE splits the OUTPUT in two without splitting the sources:
+#
+#   <NAME>.exe          engine + framework + the loader main()  (the HOST)
+#   application.dll     the project's own src/                  (the MODULE)
+#
+# The same src/main.cpp builds either way - ST_APP_ENTRY (Framework/stModule.h) is a
+# main() without MODULE and the module's exported descriptor with it. Editing a scene
+# then relinks a small DLL instead of a 12 MB executable. Read Framework/stModule.h
+# before turning it on: it is a matched-version boundary, not a stable ABI, and the
+# two halves must ship together.
+
+include_guard(GLOBAL)
+
+# Dev build mode (Framework/dev/DevBuild.h): editor saves go back into the project's
+# assets/ folder, and the game re-converts that folder at launch when it changed. OFF for
+# anything you ship - a shipped game must not reach into a source tree.
+option(SIMTARY_DEV_BUILD "Dev build: save assets into the project's assets/ and sync them at launch" OFF)
+
+include(SimtaryProject)
+
+# CACHE INTERNAL, not a plain set(): this file is included from Simtary/CMakeLists.txt,
+# which a game add_subdirectory()s from its own (parent) scope. A directory-scope
+# variable set down there would not be visible back up in the game's CMakeLists.
+set(SIMTARY_FRAMEWORK_DIR "${SIMTARY_ROOT}/Framework" CACHE INTERNAL "Simtary framework sources")
+
+# copy_directory_if_different skips unchanged files, which matters for the ~380-file
+# engine shader tree staged on every build. Added in CMake 3.26.
+if (CMAKE_VERSION VERSION_LESS "3.26.0")
+    set(_SIMTARY_COPY_DIR copy_directory)
+else()
+    set(_SIMTARY_COPY_DIR copy_directory_if_different)
+endif()
+set(SIMTARY_COPY_DIR_CMD "${_SIMTARY_COPY_DIR}" CACHE INTERNAL "cmake -E directory copy mode")
+
+# build_number.txt is PROJECT-level: only a build of that project may advance it.
+# Turn this OFF for compile-checks that are not real project builds - the engine-side
+# sweep (SIMTARY_BUILD_PROJECTS) and CI both do, so they never inflate the counter.
+# version.h is still generated at configure time either way, so ST_APP_BUILD_NUMBER
+# always resolves.
+option(SIMTARY_BUMP_BUILD_NUMBER "Advance <project>/build_number.txt on every build" ON)
+
+# simtary_compile_shader()
+# Compile one HLSL file into the app's runtime shader folders. On Windows that is BOTH
+# backends - <exe>/shaders/hlsl6 for DirectX 12 and <exe>/shaders/spirv for Vulkan -
+# because a Windows build can start on either one (Framework/render/GraphicsAPI.h) and
+# the engine appends the backend subfolder to its shader path at startup. Linux is
+# Vulkan only, so it gets spirv alone.
+#
+#   simtary_compile_shader(TARGET MyGame SOURCE assets/shaders/FooPS.hlsl PROFILE ps_6_0)
+#
+# The compiler is `stshaderc` (tools/stshaderc.cpp), not dxc.exe. dxc.exe was the wrong
+# tool for a build that must produce SPIR-V on Windows: the copy that ships with the
+# Windows SDK is DXIL only, so this needed a Vulkan SDK installed to build a complete
+# Windows game. stshaderc drives the dxcompiler.dll vendored in Engine/ through
+# wi::shadercompiler, which always has both.
+# SIMTARY_NO_SHADERS: a build that never renders - the portable Linux SERVER build made in the
+# Debian 11 chroot (MULTIPLAYER.md), whose old libstdc++ cannot load the vendored dxcompiler
+# anyway. Skips every shader compile and the cache warm-up; run it with --server only.
+option(SIMTARY_NO_SHADERS "Skip shader compilation (headless server builds; the result cannot render)" OFF)
+
+function(simtary_compile_shader)
+    if (SIMTARY_NO_SHADERS)
+        return()
+    endif()
+    cmake_parse_arguments(SH "ENGINE_ENV" "TARGET;SOURCE;PROFILE;ENTRY;OUTPUT_NAME" "" ${ARGN})
+    if (NOT SH_TARGET OR NOT SH_SOURCE OR NOT SH_PROFILE)
+        message(FATAL_ERROR "simtary_compile_shader: TARGET, SOURCE and PROFILE are required")
+    endif()
+    if (NOT SH_ENTRY)
+        set(SH_ENTRY main)
+    endif()
+    if (NOT SH_OUTPUT_NAME)
+        get_filename_component(SH_OUTPUT_NAME "${SH_SOURCE}" NAME_WE)
+    endif()
+    # Absolute, because the command below runs from stshaderc's own directory - see the
+    # WORKING_DIRECTORY note there. A relative SOURCE still means what it looks like:
+    # relative to the CMakeLists that called this.
+    get_filename_component(SH_SOURCE "${SH_SOURCE}" ABSOLUTE)
+
+    if (WIN32)
+        set(_backends hlsl6 spirv)
+    else()
+        set(_backends spirv)
+    endif()
+
+    # ENGINE_ENV: the shader includes globals.hlsli and reads the engine's bindless
+    # heaps, camera and frame constants, so it needs the engine's include path. The
+    # rest of that environment - the DX12 default root signature, the Vulkan binding
+    # shifts and the descriptor set numbers - is applied by wi::shadercompiler itself,
+    # per format, from GraphicsDevice_Vulkan's own constants; CMake used to carry a
+    # hand-written copy of them that could drift. Runtime compilation is not an option
+    # here: dxcompiler.dll is not shipped next to the exe, so a shader that is not built
+    # now is never built.
+    set(_engine_args "")
+    if (SH_ENGINE_ENV)
+        list(APPEND _engine_args
+            -I "${SIMTARY_ROOT}/Engine/shaders"
+            -I "${SIMTARY_ROOT}/assets/shaders")
+    endif()
+
+    add_dependencies(${SH_TARGET} stshaderc)
+    foreach(_backend IN LISTS _backends)
+        add_custom_command(TARGET ${SH_TARGET} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${SH_TARGET}>/shaders/${_backend}
+            COMMAND stshaderc -T ${SH_PROFILE} -E ${SH_ENTRY} -F ${_backend} ${_engine_args}
+                "${SH_SOURCE}"
+                -Fo $<TARGET_FILE_DIR:${SH_TARGET}>/shaders/${_backend}/${SH_OUTPUT_NAME}.cso
+            # From stshaderc's own directory: on Linux wi::shadercompiler loads
+            # "./libdxcompiler.so", a path relative to the WORKING DIRECTORY rather than
+            # to the executable, so anywhere else it would not find the compiler at all.
+            WORKING_DIRECTORY $<TARGET_FILE_DIR:stshaderc>
+            COMMENT "Compiling ${SH_OUTPUT_NAME} -> shaders/${_backend}/"
+            VERBATIM
+        )
+    endforeach()
+endfunction()
+
+# _simtary_collect_static_libs()
+# Every static library that ends up on a target's link line, transitively.
+#
+# The direct list is not enough: the engine links Utility, Jolt and LUA as separate
+# archives that Simtary.lib does NOT absorb (linking a static library to an OBJECT
+# library does not merge the two), so a symbol like OffsetAllocator::free lives in a
+# lib nobody names in simtary_add_app. The module export list has to see all of them
+# or the module fails to link against symbols the host demonstrably has.
+function(_simtary_collect_static_libs TARGET OUT_VAR)
+    set(_seen "")
+    set(_found "")
+    set(_queue "${TARGET}")
+
+    while (_queue)
+        list(POP_FRONT _queue _item)
+
+        # PRIVATE dependencies of an INTERFACE/static target arrive wrapped; anything
+        # else built out of a generator expression cannot be resolved at configure
+        # time and is skipped rather than guessed at.
+        if (_item MATCHES "^\\$<LINK_ONLY:(.+)>$")
+            set(_item "${CMAKE_MATCH_1}")
+        endif()
+        if (_item MATCHES "\\$<")
+            continue()
+        endif()
+        if (NOT TARGET ${_item})
+            continue()   # a bare system library (user32, dbghelp, ...)
+        endif()
+
+        get_target_property(_aliased ${_item} ALIASED_TARGET)
+        if (_aliased)
+            set(_item "${_aliased}")
+        endif()
+        if (_item IN_LIST _seen)
+            continue()
+        endif()
+        list(APPEND _seen ${_item})
+
+        get_target_property(_type ${_item} TYPE)
+        if (_type STREQUAL "STATIC_LIBRARY")
+            list(APPEND _found ${_item})
+        endif()
+
+        # INTERFACE libraries carry no LINK_LIBRARIES, and imported targets carry no
+        # INTERFACE_LINK_LIBRARIES worth walking; both come back NOTFOUND and are
+        # simply not queued.
+        if (NOT _type STREQUAL "INTERFACE_LIBRARY")
+            get_target_property(_direct ${_item} LINK_LIBRARIES)
+            if (_direct)
+                list(APPEND _queue ${_direct})
+            endif()
+        endif()
+        get_target_property(_iface ${_item} INTERFACE_LINK_LIBRARIES)
+        if (_iface)
+            list(APPEND _queue ${_iface})
+        endif()
+    endwhile()
+
+    set(${OUT_VAR} "${_found}" PARENT_SCOPE)
+endfunction()
+
+# simtary_add_app()
+function(simtary_add_app)
+    set(_opts NO_SHADER_WARM NO_CRASH_REPORTER PACK_ASSETS PACK_ONLY MODULE)
+    set(_one  NAME ORGANIZATION ICON SOURCE_DIR ASSETS_DIR CONTENT_SUBDIR SCENE_SUBDIR
+              RESOURCE_SUBDIR PACK_NAME PACK_PART_SIZE PACK_LEVEL PACK_ON_CONFLICT
+              MODULE_NAME)
+    set(_multi EXTRA_SOURCES EXTRA_INCLUDES EXTRA_LIBS EXTENSIONS)
+    cmake_parse_arguments(APP "${_opts}" "${_one}" "${_multi}" ${ARGN})
+
+    if (NOT APP_NAME)
+        message(FATAL_ERROR "simtary_add_app: NAME is required")
+    endif()
+    # Android: the app is ONE shared library that SDL's Java activity loads (libmain.so).
+    # There is no executable to host a module, so the exe + module split does not apply.
+    if (ANDROID AND APP_MODULE)
+        message(STATUS "simtary_add_app(${APP_NAME}): MODULE ignored on Android - one libmain.so")
+        set(APP_MODULE OFF)
+    endif()
+    if (NOT APP_SOURCE_DIR)
+        set(APP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    endif()
+    if (NOT APP_ASSETS_DIR)
+        set(APP_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets")
+    endif()
+    if (NOT DEFINED APP_CONTENT_SUBDIR)
+        set(APP_CONTENT_SUBDIR "contents")
+    endif()
+    # Maps live BESIDE the content tree, not inside it. assets/contents/ is "everything
+    # here becomes a packed resource"; a .wiscene is not a resource, it is the source a
+    # .stsd is converted from, and shipping it would be a second copy of every map. Two
+    # folders means neither step needs an exception list.
+    if (NOT DEFINED APP_SCENE_SUBDIR)
+        set(APP_SCENE_SUBDIR "scenes")
+    endif()
+    set(APP_SCENE_DIR "")
+    if (APP_SCENE_SUBDIR AND EXISTS ${APP_ASSETS_DIR}/${APP_SCENE_SUBDIR})
+        set(APP_SCENE_DIR ${APP_ASSETS_DIR}/${APP_SCENE_SUBDIR})
+    endif()
+
+    # assets/resources/ - loose resource FILES merged into the package at pack time,
+    # under the same relative names the maps ask for.
+    #
+    # This is what makes hand-swapping a map work. A .stsd is metadata plus an entity
+    # blob; the textures and meshes it references are NOT in it, they are in the package
+    # its .wiscene was converted alongside. Drop a .stsd in from somewhere else and the
+    # package has nothing for it to load. Put that map's resources here and the packer
+    # merges them in, so the swap is a swap and not a map that renders untextured.
+    #
+    # Singular "resource" is accepted too, because that is what people type.
+    if (NOT DEFINED APP_RESOURCE_SUBDIR)
+        set(APP_RESOURCE_SUBDIR "resources")
+    endif()
+    set(APP_RESOURCE_DIR "")
+    if (EXISTS ${APP_ASSETS_DIR}/resource AND NOT EXISTS ${APP_ASSETS_DIR}/${APP_RESOURCE_SUBDIR})
+        # Singular, because someone already made that folder and meant it.
+        set(APP_RESOURCE_DIR ${APP_ASSETS_DIR}/resource)
+    elseif (APP_RESOURCE_SUBDIR AND EXISTS ${APP_ASSETS_DIR})
+        # Made rather than merely detected: the packer MIRRORS every map resource into it
+        # on the way past (see PACK_MIRROR below), and a folder that only exists once
+        # someone thinks to create it is a folder that is empty on the one build where it
+        # mattered - which is exactly how a .wiscene leaves a project and takes the whole
+        # map's textures with it.
+        set(APP_RESOURCE_DIR ${APP_ASSETS_DIR}/${APP_RESOURCE_SUBDIR})
+        file(MAKE_DIRECTORY ${APP_RESOURCE_DIR})
+    endif()
+    # project descriptor
+    # assets/project.stpd is the build-time manifest (identity, icon, version). It is
+    # read here, at configure time, and never at runtime - which is why it lives in
+    # assets/ and not assets/contents/, the folder that ships with the game.
+    # Explicit simtary_add_app() arguments still win over the file.
+    simtary_read_project_descriptor("${CMAKE_CURRENT_SOURCE_DIR}/assets/project.stpd")
+
+    if (NOT APP_ORGANIZATION AND ST_PROJECT_ORGANIZATION)
+        set(APP_ORGANIZATION "${ST_PROJECT_ORGANIZATION}")
+    endif()
+    if (NOT APP_ICON AND ST_PROJECT_ICON)
+        set(APP_ICON "${ST_PROJECT_ICON}")
+    endif()
+    if (NOT APP_ORGANIZATION)
+        set(APP_ORGANIZATION "DPSoftware")
+    endif()
+
+    # Display name is what a player sees (window title, About box, exe metadata); the
+    # CMake target name stays the exe filename and must be a valid identifier.
+    if (ST_PROJECT_NAME)
+        set(ST_APP_DISPLAY_NAME "${ST_PROJECT_NAME}")
+    else()
+        set(ST_APP_DISPLAY_NAME "${APP_NAME}")
+    endif()
+    if (ST_PROJECT_COPYRIGHT)
+        set(ST_APP_COPYRIGHT "${ST_PROJECT_COPYRIGHT}")
+    else()
+        string(TIMESTAMP _year "%Y")
+        set(ST_APP_COPYRIGHT "Copyright (C) ${_year} ${APP_ORGANIZATION}")
+    endif()
+
+    set(ST_APP_ORGANIZATION "${APP_ORGANIZATION}")
+
+    # sources
+    # The framework is rebuilt per app on purpose (see the header comment).
+    file(GLOB_RECURSE _framework_sources CONFIGURE_DEPENDS
+        ${SIMTARY_FRAMEWORK_DIR}/*.cpp
+        ${SIMTARY_FRAMEWORK_DIR}/*.h
+    )
+    file(GLOB_RECURSE _app_sources CONFIGURE_DEPENDS
+        ${APP_SOURCE_DIR}/*.cpp
+        ${APP_SOURCE_DIR}/*.h
+    )
+    if (NOT _app_sources)
+        message(FATAL_ERROR "simtary_add_app(${APP_NAME}): no sources found under ${APP_SOURCE_DIR}")
+    endif()
+
+    if (NOT _framework_sources)
+        message(FATAL_ERROR "simtary_add_app(${APP_NAME}): no framework sources under ${SIMTARY_FRAMEWORK_DIR}")
+    endif()
+
+    # Extensions (cmake/SimtaryExtension.cmake): their sources join the framework's, their
+    # usage requirements reach every compile target, their shared libraries are staged.
+    set(_ext_targets "")
+    set(_ext_runtime "")
+    set(_ext_all_sources "")
+    foreach (_ext IN LISTS APP_EXTENSIONS)
+        if (NOT TARGET StExt_${_ext})
+            message(FATAL_ERROR "simtary_add_app(${APP_NAME}): extension '${_ext}' is not loaded - "
+                                "call stratary_add_extension(<its directory>) before simtary_add_app")
+        endif()
+        list(APPEND _ext_targets StExt_${_ext})
+        get_target_property(_ext_sources StExt_${_ext} ST_EXT_SOURCES)
+        if (_ext_sources)
+            list(APPEND _framework_sources ${_ext_sources})
+            list(APPEND _ext_all_sources ${_ext_sources})
+        endif()
+        get_target_property(_ext_libs StExt_${_ext} ST_EXT_RUNTIME)
+        if (_ext_libs)
+            list(APPEND _ext_runtime ${_ext_libs})
+        endif()
+    endforeach()
+
+    # targets
+    # Default layout: one executable holding engine, framework and game.
+    #
+    # MODULE layout: the game's own sources move into a separate shared library that
+    # the executable loads at startup (Framework/stModule.h explains the boundary).
+    # The split is by TARGET, not by source: the same src/main.cpp builds either way,
+    # because ST_APP_ENTRY expands to a main() or to the module's exported descriptor
+    # depending on ST_MODULE_BUILD.
+    #
+    # Both halves are compiled through OBJECT libraries rather than straight into
+    # their final target. That is what lets the export list below be derived: the
+    # game's object files have to exist, and be inspectable, before the host links.
+    set(_module_target   "")
+    set(_gamecode_target "")
+    if (APP_MODULE)
+        if (NOT APP_MODULE_NAME)
+            # "application" by default, so the host does not have to know the project's
+            # name to find it. Pass MODULE_NAME to use the project's name instead.
+            set(APP_MODULE_NAME "application")
+        endif()
+        set(_module_target   ${APP_NAME}_Module)
+        set(_gamecode_target ${APP_NAME}_GameCode)
+        set(_framework_target ${APP_NAME}_Framework)
+
+        add_library(${_framework_target} OBJECT ${_framework_sources})
+        add_library(${_gamecode_target}  OBJECT ${_app_sources} ${APP_EXTRA_SOURCES})
+        add_executable(${APP_NAME} $<TARGET_OBJECTS:${_framework_target}>)
+        set_target_properties(${APP_NAME} PROPERTIES LINKER_LANGUAGE CXX)
+
+        # The module is a MODULE library, not SHARED: nothing links against it, it is
+        # opened with LoadLibrary/dlopen. PREFIX "" keeps the file called
+        # "application.dll"/"application.so" on every platform instead of picking up
+        # a "lib" on Unix, so AppConfig and the installer can name it once.
+        # MODULE_NAME is free-form: "application" (the default), the project's own name,
+        # or anything else. Two things have to be kept out of its way for that to hold.
+        #
+        # The import library and its .exp go to a build-only folder rather than next to
+        # the exe. Nothing links them - the host opens the module with LoadLibrary and
+        # GetProcAddress - and leaving them in the output directory means MODULE_NAME
+        # Milistry would try to write the Milistry.lib the HOST already owns, quietly
+        # replacing the import library the module itself links against.
+        #
+        # The PDB has the same collision and a worse failure: the two would overwrite
+        # each other and one binary would symbolise as addresses. dbghelp finds a PDB
+        # through the name recorded in the image, not by matching file names, so giving
+        # the module's a suffix costs nothing.
+        set(_module_pdb "${APP_MODULE_NAME}")
+        if (APP_MODULE_NAME STREQUAL APP_NAME)
+            set(_module_pdb "${APP_MODULE_NAME}_module")
+        endif()
+
+        add_library(${_module_target} MODULE $<TARGET_OBJECTS:${_gamecode_target}>)
+        set_target_properties(${_module_target} PROPERTIES
+            OUTPUT_NAME     ${APP_MODULE_NAME}
+            PREFIX          ""
+            LINKER_LANGUAGE CXX
+            LIBRARY_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:${APP_NAME}>"
+            RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:${APP_NAME}>"
+            ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/module"
+            PDB_NAME        "${_module_pdb}"
+        )
+        set_target_properties(${_gamecode_target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    else()
+        set(_framework_target ${APP_NAME})
+        if (ANDROID)
+            # SDLActivity does System.loadLibrary("main") and calls SDL_main in it.
+            add_library(${APP_NAME} SHARED ${_app_sources} ${_framework_sources} ${APP_EXTRA_SOURCES})
+            set_target_properties(${APP_NAME} PROPERTIES OUTPUT_NAME main)
+        else()
+            add_executable(${APP_NAME} ${_app_sources} ${_framework_sources} ${APP_EXTRA_SOURCES})
+        endif()
+    endif()
+
+    # Every target that actually compiles C++ and therefore needs the include paths,
+    # the flags and the engine's usage requirements. Linking a library to an OBJECT
+    # library hands over those requirements without linking anything, which is exactly
+    # what the two halves need.
+    # The executable stays in the list even in MODULE mode: it compiles no C++ there,
+    # but it is still the target that does the linking and so needs the same libraries.
+    set(_compile_targets ${APP_NAME})
+    if (APP_MODULE)
+        list(APPEND _compile_targets ${_framework_target} ${_gamecode_target})
+    endif()
+
+    # The render boundary (EDITIONS.md, Phase 1): Framework code outside the Detroit-only
+    # list must not reach into Wicked's renderer - checked before the framework compiles,
+    # again whenever any of its sources changes. Game code is reported, never refused.
+    file(GLOB_RECURSE _boundary_inputs CONFIGURE_DEPENDS ${SIMTARY_FRAMEWORK_DIR}/*.inl)
+    set(_boundary_script "${SIMTARY_FRAMEWORK_DIR}/../cmake/SimtaryRenderBoundary.cmake")
+    set(_boundary_stamp "${CMAKE_CURRENT_BINARY_DIR}/${APP_NAME}_render_boundary.stamp")
+    add_custom_command(
+        OUTPUT "${_boundary_stamp}"
+        COMMAND ${CMAKE_COMMAND} -DFRAMEWORK_DIR=${SIMTARY_FRAMEWORK_DIR} -DAPP_DIR=${APP_SOURCE_DIR}
+                -DSTAMP=${_boundary_stamp} -P ${_boundary_script}
+        DEPENDS ${_framework_sources} ${_boundary_inputs} ${_app_sources} ${_boundary_script}
+        COMMENT "Checking the render boundary (Framework/render/api)"
+        VERBATIM)
+    add_custom_target(${APP_NAME}_RenderBoundary DEPENDS "${_boundary_stamp}")
+    add_dependencies(${_framework_target} ${APP_NAME}_RenderBoundary)
+
+    # Hurricanes (Filament) materials: Framework/render/hurricanes/materials/*.mat compiled by
+    # matc into <exe>/shaders/filament/*.filamat, which HurricanesRenderer loads at startup.
+    # Filament's public headers need C++20 (designated initializers); the workspace is C++17.
+    # Only the translation units that include them are built as C++20 - MSVC's C++17 and C++20
+    # objects link together, and nothing Filament-typed crosses the HurricanesRenderer.h boundary.
+    if (TARGET SimtaryFilament)
+        file(GLOB _filament_tus CONFIGURE_DEPENDS ${SIMTARY_FRAMEWORK_DIR}/render/hurricanes/*.cpp)
+        set_source_files_properties(${_filament_tus} TARGET_DIRECTORY ${_framework_target}
+            PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/std:c++20,-std=c++20>")
+    endif()
+    if (TARGET SimtaryFilament AND EXISTS "${SIMTARY_FILAMENT_MATC}")
+        file(GLOB _filament_mats CONFIGURE_DEPENDS ${SIMTARY_FRAMEWORK_DIR}/render/hurricanes/materials/*.mat)
+        set(_filamats "")
+        foreach(_mat IN LISTS _filament_mats)
+            get_filename_component(_mat_name "${_mat}" NAME_WE)
+            set(_out "${CMAKE_CURRENT_BINARY_DIR}/filament_materials/${_mat_name}.filamat")
+            add_custom_command(
+                OUTPUT "${_out}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/filament_materials"
+                COMMAND "${SIMTARY_FILAMENT_MATC}" -p desktop -a opengl -o "${_out}" "${_mat}"
+                DEPENDS "${_mat}"
+                COMMENT "matc ${_mat_name}.mat"
+                VERBATIM)
+            list(APPEND _filamats "${_out}")
+        endforeach()
+        add_custom_target(${APP_NAME}_FilamentMaterials ALL DEPENDS ${_filamats}
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${APP_NAME}>/shaders/filament"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_filamats} "$<TARGET_FILE_DIR:${APP_NAME}>/shaders/filament/"
+            VERBATIM)
+        add_dependencies(${APP_NAME} ${APP_NAME}_FilamentMaterials)
+    endif()
+
+    # Where the editor writes a saved map's raw resources (Framework/devui/imeditor.cpp).
+    # A SOURCE-tree path, and that is the point: the running game sits in the build
+    # output, while the folder the packer merges from is beside the project's assets, so
+    # the editor cannot find it by looking around itself. Baked into the framework only -
+    # nothing outside the editor reads it, and an editor is developer tooling. Empty when
+    # the project has no assets folder at all, which turns the export off rather than
+    # guessing a destination.
+    target_compile_definitions(${_framework_target} PRIVATE
+        ST_PROJECT_RESOURCE_DIR="${APP_RESOURCE_DIR}")
+    # Same idea for the Script Editor (Framework/devui/imscripteditor.cpp): Save writes the
+    # AUTHORING copy under assets/contents/, so the next build packs the edit, while the
+    # running game picks it up at once through ScriptSystem's in-memory override.
+    set(_content_dir "")
+    if (APP_CONTENT_SUBDIR AND EXISTS ${APP_ASSETS_DIR}/${APP_CONTENT_SUBDIR})
+        set(_content_dir ${APP_ASSETS_DIR}/${APP_CONTENT_SUBDIR})
+    endif()
+    target_compile_definitions(${_framework_target} PRIVATE
+        ST_PROJECT_CONTENT_DIR="${_content_dir}")
+
+    # Extension sources sit outside Stratary's Framework/: each gets its own IDE folder.
+    set(_engine_framework_sources ${_framework_sources})
+    if (_ext_all_sources)
+        list(REMOVE_ITEM _engine_framework_sources ${_ext_all_sources})
+    endif()
+    source_group(TREE ${SIMTARY_FRAMEWORK_DIR} PREFIX "Simtary/Framework" FILES ${_engine_framework_sources})
+    foreach (_ext IN LISTS APP_EXTENSIONS)
+        get_target_property(_ext_dir StExt_${_ext} INTERFACE_INCLUDE_DIRECTORIES)
+        get_target_property(_ext_sources StExt_${_ext} ST_EXT_SOURCES)
+        if (_ext_sources)
+            list(GET _ext_dir 0 _ext_dir)
+            source_group(TREE ${_ext_dir} PREFIX "${_ext}/Framework" FILES ${_ext_sources})
+        endif()
+    endforeach()
+    source_group(TREE ${APP_SOURCE_DIR}        PREFIX "src"               FILES ${_app_sources})
+
+    # Descriptor version wins: it is the one a release is cut from.
+    if (ST_PROJECT_VERSION)
+        set(_app_version ${ST_PROJECT_VERSION})
+    elseif (PROJECT_VERSION)
+        set(_app_version ${PROJECT_VERSION})
+    else()
+        set(_app_version 1.0.0)
+    endif()
+    string(REPLACE "." ";" _vparts "${_app_version}")
+    list(LENGTH _vparts _vcount)
+    if (_vcount GREATER_EQUAL 3 AND NOT ANDROID) # a versioned libmain.so.1 would not load
+        set_target_properties(${APP_NAME} PROPERTIES VERSION ${_app_version})
+        list(GET _vparts 0 _vmajor)
+        set_target_properties(${APP_NAME} PROPERTIES SOVERSION ${_vmajor})
+    endif()
+    set(ST_APP_VERSION_STRING "${_app_version}")
+
+    # build number / versioning
+    # A persistent per-project counter (build_number.txt, gitignored) is
+    # incremented before every build and baked into a generated version.h, which
+    # the About window shows. The changing header forces sysui.cpp to recompile so
+    # the number is always current.
+    set(_counter  ${CMAKE_CURRENT_SOURCE_DIR}/build_number.txt)
+    set(_template ${SIMTARY_FRAMEWORK_DIR}/version.h.in)
+    set(_gendir   ${CMAKE_CURRENT_BINARY_DIR}/generated/${APP_NAME})
+    set(_header   ${_gendir}/version.h)
+
+    # Generate once at configure time (no bump) so IDEs/indexers and the very first
+    # compile always find version.h.
+    if (NOT EXISTS "${_header}")
+        execute_process(COMMAND ${CMAKE_COMMAND}
+            -DCOUNTER_FILE=${_counter}
+            -DTEMPLATE=${_template}
+            -DOUTPUT=${_header}
+            -DPROJECT_VER=${_app_version}
+            -DBUMP=OFF
+            -P ${SIMTARY_ROOT}/cmake/IncrementBuild.cmake
+        )
+    endif()
+
+    # Identity header generated from the descriptor, so main.cpp never repeats the
+    # name/organization/copyright that the manifest already states. Unconditional: it is
+    # not a build-number artefact, and generating it only when the counter may advance
+    # left every SIMTARY_BUILD_PROJECTS sweep (which forces the bump OFF) without a
+    # stProject.h to include.
+    configure_file(
+        ${SIMTARY_FRAMEWORK_DIR}/stProject.h.in
+        ${_gendir}/stProject.h
+        @ONLY
+    )
+
+    if (SIMTARY_BUMP_BUILD_NUMBER)
+        add_custom_target(${APP_NAME}_BumpBuildNumber
+            COMMAND ${CMAKE_COMMAND}
+                -DCOUNTER_FILE=${_counter}
+                -DTEMPLATE=${_template}
+                -DOUTPUT=${_header}
+                -DPROJECT_VER=${_app_version}
+                -P ${SIMTARY_ROOT}/cmake/IncrementBuild.cmake
+            BYPRODUCTS ${_header}
+            COMMENT "Bumping ${APP_NAME} build number"
+            VERBATIM
+        )
+        set_target_properties(${APP_NAME}_BumpBuildNumber PROPERTIES FOLDER "${APP_NAME}/Build")
+        # Every target that compiles against the generated version.h, which in MODULE
+        # mode is the two object libraries rather than the executable itself.
+        foreach (_target IN LISTS _compile_targets)
+            add_dependencies(${_target} ${APP_NAME}_BumpBuildNumber)
+        endforeach()
+    else()
+        message(STATUS "${APP_NAME}: build number frozen (SIMTARY_BUMP_BUILD_NUMBER=OFF)")
+    endif()
+
+    # Windows resources (icon + version info)
+    if (WIN32)
+        string(TIMESTAMP PROJECT_YEAR "%Y")
+        set(PROJECT_NAME "${APP_NAME}")           # consumed by app.rc.in
+        set(PROJECT_VERSION "${_app_version}")
+        list(GET _vparts 0 PROJECT_VERSION_MAJOR)
+        list(GET _vparts 1 PROJECT_VERSION_MINOR)
+        list(GET _vparts 2 PROJECT_VERSION_PATCH)
+        if (APP_ICON)
+            get_filename_component(ST_APP_ICON "${APP_ICON}" ABSOLUTE BASE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+        else()
+            set(ST_APP_ICON "")
+        endif()
+        if (ST_APP_ICON AND EXISTS "${ST_APP_ICON}")
+            configure_file(
+                ${SIMTARY_FRAMEWORK_DIR}/app.rc.in
+                ${CMAKE_CURRENT_BINARY_DIR}/${APP_NAME}.rc
+                @ONLY
+            )
+            target_sources(${APP_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/${APP_NAME}.rc)
+        elseif (APP_ICON)
+            message(WARNING "simtary_add_app(${APP_NAME}): ICON '${APP_ICON}' not found - no .rc generated")
+        endif()
+    endif()
+
+    # include paths + libraries
+    # Applied to every target in _compile_targets. For the executable that means a
+    # real link; for the MODULE-mode object libraries it means the include paths and
+    # compile definitions only, since an OBJECT library takes usage requirements
+    # without linking anything. Both halves therefore compile against exactly the
+    # same headers and flags, which is what the build id at the bottom then asserts.
+    set(_app_link_libraries
+        Simtary::AppFlags   # exceptions-off / RTTI-off contract, matching the engine
+        Simtary
+        SimtaryModelIO      # tinygltf + ufbx, for Framework/io/model (both are C)
+        SimtaryScript       # Taipan + its exception-free bridge, for Framework/script
+        SDL2::SDL2
+        ImGui_Lib
+        sentry::sentry
+        libzmq-static   # ZeroMQ C API (zmq.h); propagates include dir + ZMQ_STATIC + sys libs
+        OpenAL          # openal-soft; also linked PUBLIC by Simtary_common (stAudio.cpp)
+        libgfx          # software 2D rasterizer (GFX.h); propagates its include dir + GFXSDL
+        RmlUi::RmlUi    # game UI documents (Framework/ui); core + debugger, FreeType fonts
+        $<$<TARGET_EXISTS:SimtaryFilament>:SimtaryFilament>   # Hurricanes renderer (SIMTARY_RENDERERS)
+        ${_ext_targets}                                       # extensions (EXTENSIONS)
+        ${APP_EXTRA_LIBS}
+    )
+    if (TARGET SimtaryOpenXR)
+        list(APPEND _app_link_libraries SimtaryOpenXR)   # Framework/xr (SIMTARY_HAS_OPENXR)
+    endif()
+    if (TARGET SimtaryGNS)
+        list(APPEND _app_link_libraries SimtaryGNS)      # Framework/net (SIMTARY_HAS_GNS)
+    endif()
+    if (TARGET SimtaryBHS)
+        list(APPEND _app_link_libraries SimtaryBHS)      # Framework/stream (SIMTARY_HAS_BHS)
+    endif()
+    if (TARGET SimtaryEOS)
+        list(APPEND _app_link_libraries SimtaryEOS)      # Framework/online (SIMTARY_HAS_EOS)
+    endif()
+
+    foreach (_target IN LISTS _compile_targets)
+        target_include_directories(${_target} PRIVATE
+            ${SIMTARY_FRAMEWORK_DIR}    # stApp.h, stRun.h, io/, sysui/, input/, ...
+            ${SIMTARY_ROOT}/Engine      # Simtary.h and the rest of the engine core
+            ${SIMTARY_ROOT}/include     # vendored headers (faust ABI, stb_image)
+            ${SIMTARY_ROOT}/assets/shaders  # shader interop headers shared with C++ (StProjectorInterop.h, StLaserInterop.h)
+            ${APP_SOURCE_DIR}           # the project's own scenes/ + components/
+            ${_gendir}                  # generated version.h
+            ${APP_EXTRA_INCLUDES}
+        )
+        target_link_libraries(${_target} PRIVATE ${_app_link_libraries})
+    endforeach()
+
+    if (WIN32)
+        # dbghelp powers the symbolized crash summary (StackWalk64) in Framework/crash/CrashHandler.cpp
+        target_link_libraries(${APP_NAME} PRIVATE dbghelp)
+        # user32/gdi32/dwmapi: native Win32 loading window (Framework/SubWinStatus.cpp) + window styling
+        target_link_libraries(${APP_NAME} PRIVATE user32 gdi32 dwmapi)
+        # shell32/ole32: SHGetKnownFolderPath + CoTaskMemFree for the LocalLow user-data path
+        target_link_libraries(${APP_NAME} PRIVATE shell32 ole32)
+    elseif (ANDROID)
+        # log: __android_log_print; android: AAssetManager, ANativeWindow
+        target_link_libraries(${APP_NAME} PRIVATE log android)
+    elseif (UNIX)
+        # X11: native Xlib loading window (Framework/SubWinStatus.cpp)
+        find_package(X11 REQUIRED)
+        target_include_directories(${APP_NAME} PRIVATE ${X11_INCLUDE_DIR})
+        target_link_libraries(${APP_NAME} PRIVATE ${X11_LIBRARIES})
+        # Shared libraries (SDL2, OpenAL, Steam Audio, GNS) ship beside the executable, so the
+        # loader looks there first: a copied output folder runs on a machine that has none of
+        # them installed (a dedicated server box, MULTIPLAYER.md).
+        set_target_properties(${APP_NAME} PROPERTIES BUILD_RPATH "\$ORIGIN" INSTALL_RPATH "\$ORIGIN")
+        if (APP_MODULE)
+            set_target_properties(${APP_NAME}_Module PROPERTIES BUILD_RPATH "\$ORIGIN" INSTALL_RPATH "\$ORIGIN")
+        endif()
+    endif()
+
+    if (MSVC)
+        # Remove these if you don't need crash symbolization
+        foreach (_target IN LISTS _compile_targets)
+            target_compile_options(${_target} PRIVATE $<$<CONFIG:Release>:/Zi>)
+        endforeach()
+        target_link_options(${APP_NAME} PRIVATE
+            $<$<CONFIG:Release>:/DEBUG>
+            $<$<CONFIG:Release>:/OPT:REF>
+            $<$<CONFIG:Release>:/OPT:ICF>
+        )
+    endif()
+
+    # project module
+    if (APP_MODULE)
+        # Everything that decides how the shared C++ types are LAID OUT. Host and
+        # module compare this string at load time and refuse to run as a mismatched
+        # pair, because that mismatch has no other symptom: SIMTARY_LARGE_WORLD alone
+        # changes sizeof(TransformComponent) by 12 bytes, and a host walking a scene
+        # array at the module's stride reads plausible garbage rather than crashing.
+        set(_engine_build_id
+            "${_app_version}-${CMAKE_CXX_COMPILER_ID}${CMAKE_CXX_COMPILER_VERSION}-lw${SIMTARY_LARGE_WORLD}-rtti${WICKED_ENABLE_RTTI}")
+
+        foreach (_target IN LISTS _compile_targets)
+            target_compile_definitions(${_target} PRIVATE
+                ST_ENGINE_BUILD_ID="${_engine_build_id}-$<CONFIG>"
+                ST_MODULE_NAME="${APP_MODULE_NAME}"
+            )
+        endforeach()
+        # ST_MODULE_HOST turns on Framework/stModuleMain.cpp (the loader main) and
+        # Framework/stModuleHost.cpp; ST_MODULE_BUILD switches ST_APP_ENTRY in the
+        # project's own source from an int main() to the exported descriptor.
+        target_compile_definitions(${_framework_target} PRIVATE ST_MODULE_HOST)
+        target_compile_definitions(${_gamecode_target}  PRIVATE ST_MODULE_BUILD)
+
+        # The host has to export symbols for the module to bind to. On ELF that is
+        # all this takes (CMake adds --export-dynamic); on Windows it also needs the
+        # explicit export list built below, and it is what produces the import
+        # library the module links against.
+        set_target_properties(${APP_NAME} PROPERTIES ENABLE_EXPORTS TRUE)
+
+        if (MSVC)
+            # derived export list
+            # NOT WINDOWS_EXPORT_ALL_SYMBOLS: the engine archive alone publishes about
+            # 64,700 symbols and a PE export table holds 65,535, so exporting the
+            # engine wholesale does not fit. cmake/simtary_module_def.ps1 intersects
+            # the module's undefined externals with what the host defines instead,
+            # which is a few thousand names and needs no dllexport annotation
+            # anywhere in the engine.
+            if (NOT SIMTARY_DUMPBIN)
+                get_filename_component(_msvc_bin "${CMAKE_LINKER}" DIRECTORY)
+                find_program(SIMTARY_DUMPBIN dumpbin HINTS "${_msvc_bin}")
+                if (NOT SIMTARY_DUMPBIN)
+                    message(FATAL_ERROR
+                        "simtary_add_app(${APP_NAME} MODULE): dumpbin.exe not found next to "
+                        "the linker (${CMAKE_LINKER}). Set -DSIMTARY_DUMPBIN=<path>.")
+                endif()
+            endif()
+            find_program(SIMTARY_POWERSHELL NAMES powershell.exe powershell)
+            if (NOT SIMTARY_POWERSHELL)
+                message(FATAL_ERROR "simtary_add_app(${APP_NAME} MODULE): powershell.exe not found.")
+            endif()
+
+            # Only STATIC inputs belong in the "defined by the host" set. A shared
+            # library's import lib publishes __imp_ stubs, not code: the module links
+            # SDL2 and OpenAL itself, and re-exporting their imports from the host
+            # would bind the module to the wrong thing.
+            set(_def_inputs "$<TARGET_OBJECTS:${_framework_target}>")
+            set(_def_lib_files "")
+            _simtary_collect_static_libs(${APP_NAME} _static_libs)
+            foreach (_lib IN LISTS _static_libs)
+                list(APPEND _def_inputs "$<TARGET_FILE:${_lib}>")
+                list(APPEND _def_lib_files "$<TARGET_FILE:${_lib}>")
+            endforeach()
+            list(LENGTH _static_libs _static_lib_count)
+            message(STATUS "${APP_NAME}: module export scan covers ${_static_lib_count} static libraries")
+
+            set(_moduledir  ${CMAKE_CURRENT_BINARY_DIR}/module)
+            set(_deffile    ${_moduledir}/${APP_NAME}_exports.def)
+            set(_undeflist  ${_moduledir}/gamecode_objects.$<CONFIG>.txt)
+            set(_deflist    ${_moduledir}/host_inputs.$<CONFIG>.txt)
+
+            # Response files: the object lists are long and per-configuration, and
+            # file(GENERATE) is the only place a $<TARGET_OBJECTS:> list can be turned
+            # into text at configure time.
+            file(GENERATE OUTPUT ${_undeflist}
+                 CONTENT "$<JOIN:$<TARGET_OBJECTS:${_gamecode_target}>,\n>\n")
+            file(GENERATE OUTPUT ${_deflist}
+                 CONTENT "$<JOIN:${_def_inputs},\n>\n")
+
+            # The .def is the OUTPUT and the generator leaves its timestamp alone when
+            # the symbol set has not changed. Both halves of that matter: the step
+            # itself re-runs on every build (it has to - only the fresh object files
+            # know what the game now references), while the host relinks only when the
+            # export list genuinely moved.
+            add_custom_command(
+                OUTPUT ${_deffile}
+                COMMAND ${SIMTARY_POWERSHELL} -NoProfile -ExecutionPolicy Bypass
+                        -File ${SIMTARY_ROOT}/cmake/simtary_module_def.ps1
+                        -Dumpbin ${SIMTARY_DUMPBIN}
+                        -UndefinedFrom ${_undeflist}
+                        -DefinedFrom ${_deflist}
+                        -Output ${_deffile}
+                # FILE-level dependencies, not just the target names. With targets
+                # alone the generator has no declared inputs, so the build treats an
+                # existing .def as up to date forever: a symbol added to the engine
+                # after the first configure never reaches the export list, and the
+                # module fails to link against something the host plainly has.
+                DEPENDS $<TARGET_OBJECTS:${_gamecode_target}>
+                        $<TARGET_OBJECTS:${_framework_target}>
+                        ${_def_lib_files}
+                        ${_undeflist} ${_deflist}
+                        ${SIMTARY_ROOT}/cmake/simtary_module_def.ps1
+                        ${_gamecode_target} ${_framework_target}
+                COMMENT "Deriving ${APP_NAME} module export list"
+                VERBATIM
+            )
+            add_custom_target(${APP_NAME}_ModuleExports DEPENDS ${_deffile})
+            set_target_properties(${APP_NAME}_ModuleExports PROPERTIES FOLDER "${APP_NAME}/Build")
+            add_dependencies(${APP_NAME} ${APP_NAME}_ModuleExports)
+
+            target_link_options(${APP_NAME} PRIVATE "/DEF:${_deffile}")
+        endif()
+
+        # What the module links for itself, and deliberately nothing else. SDL2 and
+        # OpenAL are shared libraries, so both halves binding to the same DLL is one
+        # copy and one set of globals. Every static library stays host-side: linking
+        # ImGui here would give the module its own ImGui context, and linking the
+        # engine here would give it a second wi::shared_ptr allocator table.
+        target_link_libraries(${_module_target} PRIVATE
+            ${APP_NAME}     # the host's import library - the whole point
+            SDL2::SDL2
+            OpenAL
+        )
+
+        if (MSVC)
+            # The same crash-symbolization contract the host gets. Without it the module
+            # ships with no PDB, and since the module is where the GAME lives, every
+            # crash report and every stack walk stops at a bare address exactly where it
+            # was about to become useful.
+            target_link_options(${_module_target} PRIVATE
+                $<$<CONFIG:Release>:/DEBUG>
+                $<$<CONFIG:Release>:/OPT:REF>
+                $<$<CONFIG:Release>:/OPT:ICF>
+            )
+        endif()
+
+        set_target_properties(${_framework_target} PROPERTIES FOLDER "${APP_NAME}")
+        set_target_properties(${_gamecode_target}  PROPERTIES FOLDER "${APP_NAME}")
+        set_target_properties(${_module_target}    PROPERTIES FOLDER "${APP_NAME}")
+
+        message(STATUS "${APP_NAME}: module layout - host ${APP_NAME}, module ${APP_MODULE_NAME}")
+    endif()
+
+    # crash reporter
+    # The reporter GUI and the Crashpad handler must sit next to the game exe;
+    # Framework/crash/CrashHandler.cpp looks for them there at runtime.
+    # Not on Android: an app cannot launch a second process with a window there, and
+    # sentry runs its in-process backend instead of Crashpad.
+    if (NOT APP_NO_CRASH_REPORTER AND NOT ANDROID)
+        add_dependencies(${APP_NAME} SimtaryCrashReporter)
+        add_custom_command(TARGET ${APP_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:SimtaryCrashReporter> $<TARGET_FILE_DIR:${APP_NAME}>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:crashpad_handler> $<TARGET_FILE_DIR:${APP_NAME}>
+            COMMENT "Copying SimtaryCrashReporter + crashpad_handler to output directory"
+            VERBATIM
+        )
+    endif()
+
+    # framework shaders
+    # ImGui's backend shaders and the framework's procedural lens flare. Named
+    # StLensFlare* rather than LensFlare*: the engine ships its own lensFlareVS/PS
+    # and both land in the same output folder, which is case-insensitive on Windows.
+    simtary_compile_shader(TARGET ${APP_NAME} PROFILE vs_6_0 SOURCE ${SIMTARY_ROOT}/assets/shaders/ImGuiVS.hlsl)
+    simtary_compile_shader(TARGET ${APP_NAME} PROFILE ps_6_0 SOURCE ${SIMTARY_ROOT}/assets/shaders/ImGuiPS.hlsl)
+    simtary_compile_shader(TARGET ${APP_NAME} PROFILE vs_6_0 SOURCE ${SIMTARY_ROOT}/assets/shaders/StUiVS.hlsl)
+    simtary_compile_shader(TARGET ${APP_NAME} PROFILE ps_6_0 SOURCE ${SIMTARY_ROOT}/assets/shaders/StUiPS.hlsl)
+    simtary_compile_shader(TARGET ${APP_NAME} PROFILE vs_6_0 SOURCE ${SIMTARY_ROOT}/assets/shaders/StLensFlareVS.hlsl)
+    simtary_compile_shader(TARGET ${APP_NAME} PROFILE ps_6_0 SOURCE ${SIMTARY_ROOT}/assets/shaders/StLensFlarePS.hlsl)
+
+    # ENGINE_ENV: unlike the shaders above, these run inside the engine's frame - they
+    # read the depth buffer, the camera constants and the bindless heaps, so they
+    # include globals.hlsli and need the engine's compiler flags.
+    simtary_compile_shader(TARGET ${APP_NAME} PROFILE cs_6_0 ENGINE_ENV
+        SOURCE ${SIMTARY_ROOT}/assets/shaders/StProjectorCS.hlsl)
+    simtary_compile_shader(TARGET ${APP_NAME} PROFILE cs_6_0 ENGINE_ENV
+        SOURCE ${SIMTARY_ROOT}/assets/shaders/StLaserCS.hlsl)
+
+    # engine shader sources + shared compiled cache
+    # The engine compiles its ~360 HLSL shaders on first launch and caches the DXIL
+    # in "<exe>/shaders/hlsl6/" (Vulkan: "spirv/"). Simtary/shaders/ holds that cache
+    # checked in at the engine level, so it is SHARED: every project starts from the
+    # warm cache instead of paying the cold compile itself. Editing a widely-included
+    # header (globals.hlsli) invalidates it, and the incremental pre-pass below
+    # recompiles only what changed.
+    add_custom_command(TARGET ${APP_NAME} PRE_LINK
+        COMMAND ${CMAKE_COMMAND} -E ${SIMTARY_COPY_DIR_CMD}
+            ${SIMTARY_ROOT}/Engine/shaders $<TARGET_FILE_DIR:${APP_NAME}>/shaders
+        COMMENT "Staging engine shader sources -> <exe>/shaders/"
+        VERBATIM
+    )
+
+    if (EXISTS ${SIMTARY_ROOT}/shaders)
+        add_custom_command(TARGET ${APP_NAME} PRE_LINK
+            COMMAND ${CMAKE_COMMAND} -E ${SIMTARY_COPY_DIR_CMD}
+                ${SIMTARY_ROOT}/shaders $<TARGET_FILE_DIR:${APP_NAME}>/shaders
+            COMMENT "Staging the shared engine shader cache -> <exe>/shaders/"
+            VERBATIM
+        )
+    endif()
+
+    # Incremental pre-pass so the first launch is never a cold compile. Turn off with
+    # NO_SHADER_WARM for the fastest possible build, at the cost of a slow first run.
+    # Not when cross-compiling for Android: offlineshadercompiler is then built for the
+    # DEVICE and cannot run here. The APK takes the shared SPIR-V cache as it is.
+    if (NOT APP_NO_SHADER_WARM AND NOT ANDROID AND NOT SIMTARY_NO_SHADERS)
+        # BOTH backends on Windows, because the build can start on either one and the
+        # backend is chosen at launch, not here. It is not twice the work in practice:
+        # Simtary/shaders/ ships a warm cache for both and this pre-pass is incremental,
+        # so a normal build recompiles only what a shader edit actually invalidated.
+        if (WIN32)
+            set(_warm hlsl6 spirv)
+        else()
+            set(_warm spirv)
+        endif()
+        add_dependencies(${APP_NAME} offlineshadercompiler)
+        string(REPLACE ";" " + " _warm_label "${_warm}")
+        add_custom_command(TARGET ${APP_NAME} POST_BUILD
+            COMMAND offlineshadercompiler ${_warm} strip_reflection quiet
+            WORKING_DIRECTORY $<TARGET_FILE_DIR:${APP_NAME}>
+            COMMENT "Warming engine shader cache (incremental) -> shaders/${_warm_label}/"
+            USES_TERMINAL
+            VERBATIM
+        )
+
+        # Opt-in: fold the freshly compiled shaders back into Simtary/shaders so the
+        # next project (and the next clean build) starts warm. Never automatic - it
+        # writes into the shared engine tree.
+        if (NOT TARGET simtary_shadercache_update)
+            add_custom_target(simtary_shadercache_update
+                COMMENT "Publishing <exe>/shaders/${_warm_label} back into Simtary/shaders/"
+            )
+            foreach(_warm_backend IN LISTS _warm)
+                add_custom_command(TARGET simtary_shadercache_update POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                        $<TARGET_FILE_DIR:${APP_NAME}>/shaders/${_warm_backend}
+                        ${SIMTARY_ROOT}/shaders/${_warm_backend}
+                    VERBATIM
+                )
+            endforeach()
+            set_target_properties(simtary_shadercache_update PROPERTIES FOLDER "Simtary")
+        endif()
+    endif()
+
+    # runtime DLLs
+    # PRE_LINK, not POST_BUILD, and that ordering is load-bearing. The shader warm
+    # step above runs offlineshadercompiler, which links the engine and therefore
+    # imports OpenAL32.dll and phonon.dll; it finds them through its WORKING_DIRECTORY,
+    # which is this output directory. Copying them in POST_BUILD puts them there AFTER
+    # the tool has already tried to start, so a clean tree dies with exit code
+    # -1073741515 (0xC0000135, STATUS_DLL_NOT_FOUND) before any DLL is staged. It only
+    # ever appeared to work because a previous build had left OpenAL32.dll behind.
+    # On Linux the loader asks for the SONAME (libopenal.so.1), not the versioned file the
+    # target builds (libopenal.so.1.24.2) - copy what will actually be looked up.
+    if (UNIX AND NOT APPLE)
+        set(_sdl2_runtime $<TARGET_SONAME_FILE:SDL2::SDL2>)
+        set(_openal_runtime $<TARGET_SONAME_FILE:OpenAL>)
+    else()
+        set(_sdl2_runtime $<TARGET_FILE:SDL2::SDL2>)
+        set(_openal_runtime $<TARGET_FILE:OpenAL>)
+    endif()
+    add_custom_command(TARGET ${APP_NAME} PRE_LINK
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${_sdl2_runtime} $<TARGET_FILE_DIR:${APP_NAME}>
+        COMMENT "Copying SDL2 runtime library to output directory"
+        VERBATIM
+    )
+    # openal-soft is built shared; its runtime DLL (OpenAL32.dll) must sit next to
+    # the executable so the audio engine can open the default output device.
+    add_custom_command(TARGET ${APP_NAME} PRE_LINK
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${_openal_runtime} $<TARGET_FILE_DIR:${APP_NAME}>
+        COMMENT "Copying OpenAL runtime library to output directory"
+        VERBATIM
+    )
+    # Steam Audio ships prebuilt; phonon.dll has to sit next to the executable for
+    # the same reason. Absent (SIMTARY_ENABLE_STEAMAUDIO=OFF, or no build for this
+    # platform) the engine runs its fallback panner and nothing needs staging.
+    if (TARGET SteamAudio)
+        add_custom_command(TARGET ${APP_NAME} PRE_LINK
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${SIMTARY_STEAMAUDIO_RUNTIME}" $<TARGET_FILE_DIR:${APP_NAME}>
+            COMMENT "Copying Steam Audio runtime library to output directory"
+            VERBATIM
+        )
+    endif()
+    # Shared libraries an extension ships (Simtary: jsbsim.dll - LGPL, replaceable) go next to the exe.
+    foreach (_lib IN LISTS _ext_runtime)
+        add_custom_command(TARGET ${APP_NAME} PRE_LINK
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:${_lib}> $<TARGET_FILE_DIR:${APP_NAME}>
+            COMMENT "Copying ${_lib} runtime library to output directory"
+            VERBATIM
+        )
+    endforeach()
+    if (TARGET SimtaryOpenXR)
+        add_custom_command(TARGET ${APP_NAME} PRE_LINK
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${SIMTARY_OPENXR_RUNTIME}" $<TARGET_FILE_DIR:${APP_NAME}>
+            COMMENT "Copying OpenXR loader to output directory"
+            VERBATIM
+        )
+    endif()
+    if (TARGET SimtaryGNS)
+        add_custom_command(TARGET ${APP_NAME} PRE_LINK
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${SIMTARY_GNS_RUNTIME}" $<TARGET_FILE_DIR:${APP_NAME}>
+            COMMENT "Copying GameNetworkingSockets to output directory"
+            VERBATIM
+        )
+    endif()
+    if (TARGET SimtaryBHS)
+        # bhs.dll and the OpenSSL DLLs it loads (libssl / libcrypto) sit side by side in its bin/
+        add_custom_command(TARGET ${APP_NAME} PRE_LINK
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${SIMTARY_BHS_BIN}/bhs.dll" "${SIMTARY_BHS_BIN}/libssl-3-x64.dll" "${SIMTARY_BHS_BIN}/libcrypto-3-x64.dll"
+                $<TARGET_FILE_DIR:${APP_NAME}>
+            COMMENT "Copying BHS to output directory"
+            VERBATIM
+        )
+    endif()
+    if (TARGET SimtaryEOS)
+        add_custom_command(TARGET ${APP_NAME} PRE_LINK
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${SIMTARY_EOS_RUNTIME}" $<TARGET_FILE_DIR:${APP_NAME}>
+            COMMENT "Copying EOS SDK to output directory"
+            VERBATIM
+        )
+    endif()
+
+    # assets
+    # Two copies, deliberately:
+    #   <build>/assets     the whole project assets tree (source shaders, dsp, ...)
+    #   <exe>/assets       just the game content, which is what the running game
+    #                      resolves paths against ("assets/splash.bmp", scenes, ...)
+    #
+    # BOTH live on a custom target, not on POST_BUILD. A POST_BUILD command only runs
+    # when the executable itself is rebuilt, so editing nothing but a .wiscene left
+    # the old copy sitting in the output: the build was "up to date" and the copy step
+    # never fired. A custom target is always considered out of date, so `cmake --build`
+    # re-syncs content whether or not a single line of C++ changed.
+    if (EXISTS ${APP_ASSETS_DIR})
+        set(_asset_copy_commands
+            COMMAND ${CMAKE_COMMAND} -E ${SIMTARY_COPY_DIR_CMD}
+                ${APP_ASSETS_DIR} ${CMAKE_CURRENT_BINARY_DIR}/assets
+        )
+        if (APP_CONTENT_SUBDIR AND EXISTS ${APP_ASSETS_DIR}/${APP_CONTENT_SUBDIR})
+            list(APPEND _asset_copy_commands
+                # make_directory first: on a clean tree the output folder does not
+                # exist yet when this runs (it runs BEFORE the link, not after).
+                COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${APP_NAME}>/assets
+            )
+            # Packing and copying loose are ALTERNATIVES, not companions.
+            #
+            # stpack takes every regular file under the content directory (tools/stpack.cpp:
+            # the only thing it skips is *.wiscene, and only because it has already
+            # converted those into .stsd). So once the package is built, a loose copy of
+            # that tree is a second copy of every asset - and a copy nothing will ever
+            # read: AssetSystem::Install() puts the packs in front of the filesystem, so a
+            # path the package holds always resolves out of the package. For Milistry that
+            # was 56 MB of dead weight beside a 90 MB package, most of it one 53 MB .wav.
+            #
+            # It is also a staleness hazard in the one case it IS read: SDL loads the
+            # splash straight off disk before the override exists (Framework/stRun.cpp), so
+            # an out-of-date loose splash.bmp wins over the packed one.
+            #
+            # This replaces an older rule that copied the whole tree and then deleted just
+            # the .wiscene and .staod files from the output. That left every other packed
+            # asset duplicated, and it re-copied them on EVERY build: copy_if_different
+            # sees the destination missing (we deleted it) and copies again.
+            #
+            # PACK_ONLY therefore now describes what PACK_ASSETS already does; it is kept
+            # as an accepted spelling so existing projects keep configuring.
+            if (NOT APP_PACK_ONLY AND NOT APP_PACK_ASSETS)
+                list(APPEND _asset_copy_commands
+                    COMMAND ${CMAKE_COMMAND} -E ${SIMTARY_COPY_DIR_CMD}
+                        ${APP_ASSETS_DIR}/${APP_CONTENT_SUBDIR}
+                        $<TARGET_FILE_DIR:${APP_NAME}>/assets
+                )
+            endif()
+        endif()
+
+        # The maps. With PACK_ASSETS the packer writes <exe>/assets/<scenes>/*.stsd
+        # itself, and copying the .wiscene sources beside them would be exactly the
+        # duplicate this layout exists to remove. Without it the .wiscene IS the shipped
+        # map, so it has to be there.
+        if (APP_SCENE_DIR AND NOT APP_PACK_ASSETS AND NOT APP_PACK_ONLY)
+            list(APPEND _asset_copy_commands
+                COMMAND ${CMAKE_COMMAND} -E ${SIMTARY_COPY_DIR_CMD}
+                    ${APP_SCENE_DIR}
+                    $<TARGET_FILE_DIR:${APP_NAME}>/assets/${APP_SCENE_SUBDIR}
+            )
+        endif()
+
+        add_custom_target(${APP_NAME}_Assets
+            ${_asset_copy_commands}
+            COMMENT "Syncing ${APP_NAME} assets -> <build>/assets and <exe>/assets"
+            VERBATIM
+        )
+        set_target_properties(${APP_NAME}_Assets PROPERTIES FOLDER "${APP_NAME}/Build")
+        add_dependencies(${APP_NAME} ${APP_NAME}_Assets)
+
+        # copy_directory_if_different only ADDS and OVERWRITES; it never deletes. A
+        # renamed or removed asset therefore lingers in the output and the game can
+        # still load it, which hides the breakage until someone ships. This target
+        # wipes the output copies first, so build it after deleting or renaming
+        # content:  cmake --build <dir> --target ${APP_NAME}_AssetsResync
+        if (APP_CONTENT_SUBDIR AND EXISTS ${APP_ASSETS_DIR}/${APP_CONTENT_SUBDIR})
+            set(_asset_resync_commands
+                COMMAND ${CMAKE_COMMAND} -E rm -rf $<TARGET_FILE_DIR:${APP_NAME}>/assets
+                COMMAND ${CMAKE_COMMAND} -E rm -rf ${CMAKE_CURRENT_BINARY_DIR}/assets
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    ${APP_ASSETS_DIR} ${CMAKE_CURRENT_BINARY_DIR}/assets
+            )
+            # Same rule as the ordinary copy above: a packed build ships the package, not
+            # a loose second copy of everything in it.
+            if (NOT APP_PACK_ONLY AND NOT APP_PACK_ASSETS)
+                list(APPEND _asset_resync_commands
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                        ${APP_ASSETS_DIR}/${APP_CONTENT_SUBDIR}
+                        $<TARGET_FILE_DIR:${APP_NAME}>/assets
+                )
+            endif()
+            if (APP_SCENE_DIR AND NOT APP_PACK_ASSETS AND NOT APP_PACK_ONLY)
+                list(APPEND _asset_resync_commands
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                        ${APP_SCENE_DIR}
+                        $<TARGET_FILE_DIR:${APP_NAME}>/assets/${APP_SCENE_SUBDIR}
+                )
+            endif()
+            if (APP_PACK_ASSETS OR APP_PACK_ONLY)
+                # The wipe above took the package with it, so the stamp has to go too or
+                # the next ordinary build thinks the pack is still current and never
+                # rebuilds it. Dropping the stamp is enough; ${APP}_Pack does the rest.
+                if (NOT APP_PACK_NAME)
+                    set(_resync_pack_name "content")
+                else()
+                    set(_resync_pack_name ${APP_PACK_NAME})
+                endif()
+                list(APPEND _asset_resync_commands
+                    COMMAND ${CMAKE_COMMAND} -E rm -f
+                        ${CMAKE_CURRENT_BINARY_DIR}/${APP_NAME}_${_resync_pack_name}.packstamp
+                )
+            endif()
+
+            add_custom_target(${APP_NAME}_AssetsResync
+                ${_asset_resync_commands}
+                COMMENT "Re-syncing ${APP_NAME} assets from scratch (drops removed files)"
+                VERBATIM
+            )
+            set_target_properties(${APP_NAME}_AssetsResync PROPERTIES FOLDER "${APP_NAME}/Build")
+        endif()
+    endif()
+
+    # asset package
+    if (APP_PACK_ASSETS OR APP_PACK_ONLY)
+        if (NOT APP_PACK_NAME)
+            set(APP_PACK_NAME "content")
+        endif()
+        if (NOT APP_PACK_PART_SIZE)
+            set(APP_PACK_PART_SIZE 50)
+        endif()
+        if (NOT APP_PACK_LEVEL)
+            set(APP_PACK_LEVEL 9)
+        endif()
+        simtary_pack_assets(
+            TARGET        ${APP_NAME}
+            CONTENT_DIR   ${APP_ASSETS_DIR}/${APP_CONTENT_SUBDIR}
+            SCENE_SRC_DIR ${APP_SCENE_DIR}
+            SCENE_SUBDIR  ${APP_SCENE_SUBDIR}
+            RESOURCE_DIR  ${APP_RESOURCE_DIR}
+            MIRROR_DIR    ${APP_RESOURCE_DIR}
+            ON_CONFLICT   ${APP_PACK_ON_CONFLICT}
+            NAME          ${APP_PACK_NAME}
+            PART_SIZE     ${APP_PACK_PART_SIZE}
+            LEVEL         ${APP_PACK_LEVEL}
+        )
+    endif()
+
+    # dev build
+    # SIMTARY_DEV_BUILD bakes the project's SOURCE asset folders and the packer's path
+    # into the framework (Framework/dev/DevBuild.h): editor saves are mirrored back into
+    # assets/, and the game re-runs the same stpack conversion as the build at launch
+    # whenever the source tree changed. Framework-only definitions, so switching it on an
+    # existing build tree recompiles the framework and nothing else.
+    if (SIMTARY_DEV_BUILD)
+        set(_dev_pack 0)
+        set(_dev_stpack "")
+        set(_dev_pack_name "content")
+        set(_dev_part_size 50)
+        if (APP_PACK_ASSETS OR APP_PACK_ONLY)
+            set(_dev_pack 1)
+            set(_dev_stpack "$<TARGET_FILE:stpack>")
+            set(_dev_pack_name ${APP_PACK_NAME})
+            set(_dev_part_size ${APP_PACK_PART_SIZE})
+            add_dependencies(${APP_NAME} stpack)
+        endif()
+        target_compile_definitions(${_framework_target} PRIVATE
+            ST_DEV_BUILD=1
+            ST_DEV_ASSETS_DIR="${APP_ASSETS_DIR}"
+            ST_DEV_SCENE_SUBDIR="${APP_SCENE_SUBDIR}"
+            ST_DEV_PACK=${_dev_pack}
+            ST_DEV_STPACK="${_dev_stpack}"
+            ST_DEV_PACK_NAME="${_dev_pack_name}"
+            ST_DEV_PACK_PART_SIZE=${_dev_part_size}
+            ST_DEV_PACK_ON_CONFLICT="${APP_PACK_ON_CONFLICT}")
+        message(STATUS "simtary_add_app(${APP_NAME}): DEV BUILD - saves go to ${APP_ASSETS_DIR}, assets sync at launch")
+    endif()
+
+    set_target_properties(${APP_NAME} PROPERTIES FOLDER "${APP_NAME}")
+endfunction()
+
+# simtary_pack_assets()
+# Build a .strd + .stafp<N> package from a content directory and drop it next to the
+# executable, converting every .wiscene it finds into a .stsd on the way.
+#
+#   simtary_pack_assets(TARGET Milistry CONTENT_DIR .../assets/contents
+#                       [SCENE_SRC_DIR .../assets/scenes]
+#                       [RESOURCE_DIR .../assets/resources ...]
+#                       [MIRROR_DIR .../assets/resources]
+#                       [ON_CONFLICT override|add|keep]
+#                       [NAME content] [PART_SIZE 50] [LEVEL 9]
+#                       [PACK_SUBDIR resources] [SCENE_SUBDIR scenes])
+#
+# Output layout under <exe>/assets/:
+#
+#   resources/content.strd      the index
+#   resources/content.stafp1..N  the payload parts
+#   scenes/<map>.stsd            one descriptor per converted .wiscene, LOOSE
+#
+# The maps stay out of the package on purpose. A .stsd is a few KB of NBT metadata in
+# front of a compressed entity blob, so leaving it visible costs nothing and makes a
+# map listable, diffable and hand-swappable without unpacking anything - while the
+# bulk, the textures and meshes every map shares, is the part that belongs in a
+# deduplicated package.
+#
+# SCENE_SRC_DIR is where the .wiscene SOURCES are read from, and it is deliberately a
+# second directory rather than a corner of CONTENT_DIR: everything under CONTENT_DIR
+# becomes a packed resource, and a .wiscene is not a resource - it is the thing a .stsd
+# is converted FROM. Keeping the two apart is what lets the content rule stay
+# exception-free and stops a 37 MB map from also shipping loose. Maps left inside
+# CONTENT_DIR are still converted, so an older project layout keeps working.
+#
+# A .stsd sitting among those sources is NOT converted - it already IS the converted
+# form. It is copied through to the scene folder untouched, and the packer reports which
+# of the resources it references the package will not hold. RESOURCE_DIR is where those
+# resources come from: a loose tree merged into the package under the same relative
+# names, so replacing a map means dropping in its .stsd plus its resources instead of
+# rebuilding the world. ON_CONFLICT says who wins when such a file collides with a
+# resource a map already embedded - override (default), add (keep both, the loose one
+# renamed) or keep (ignore the loose one).
+#
+# Unlike <APP>_Assets, this is a real add_custom_command with real DEPENDS rather than
+# an always-out-of-date target. It has to be: repacking 76 MB of maps through zstd on
+# every build, whether or not a single asset changed, is tens of seconds per build. The
+# input list is globbed with CONFIGURE_DEPENDS, so adding or removing a content file
+# re-runs configure and the dependency set follows.
+#
+# The stamp file exists because the real outputs are N part files whose count is not
+# known until the packer has run, and CMake needs one name it can depend on.
+function(simtary_pack_assets)
+    set(_one   TARGET CONTENT_DIR SCENE_SRC_DIR NAME PART_SIZE LEVEL PACK_SUBDIR
+               SCENE_SUBDIR ON_CONFLICT MIRROR_DIR)
+    set(_multi RESOURCE_DIR)
+    cmake_parse_arguments(PACK "" "${_one}" "${_multi}" ${ARGN})
+
+    if (NOT PACK_TARGET)
+        message(FATAL_ERROR "simtary_pack_assets: TARGET is required")
+    endif()
+    if (NOT PACK_NAME)
+        set(PACK_NAME "content")
+    endif()
+    if (NOT PACK_PART_SIZE)
+        set(PACK_PART_SIZE 50)
+    endif()
+    if (NOT PACK_LEVEL)
+        set(PACK_LEVEL 9)
+    endif()
+    if (NOT DEFINED PACK_PACK_SUBDIR)
+        set(PACK_PACK_SUBDIR "resources")
+    endif()
+    if (NOT DEFINED PACK_SCENE_SUBDIR)
+        set(PACK_SCENE_SUBDIR "scenes")
+    endif()
+
+    if (NOT PACK_CONTENT_DIR OR NOT EXISTS ${PACK_CONTENT_DIR})
+        message(STATUS "simtary_pack_assets(${PACK_TARGET}): no content directory, skipping")
+        return()
+    endif()
+
+    file(GLOB_RECURSE _pack_inputs CONFIGURE_DEPENDS ${PACK_CONTENT_DIR}/*)
+
+    # The scene sources are inputs too, or editing a map would not repack it. Both
+    # spellings count: a .wiscene is a map to convert, a .stsd is one that was converted
+    # already and passes through - and dropping a new .stsd in has to repack, because the
+    # resources it needs come out of the package this step builds.
+    set(_scene_src_args "")
+    if (PACK_SCENE_SRC_DIR AND EXISTS ${PACK_SCENE_SRC_DIR})
+        file(GLOB_RECURSE _scene_inputs CONFIGURE_DEPENDS
+             ${PACK_SCENE_SRC_DIR}/*.wiscene ${PACK_SCENE_SRC_DIR}/*.stsd)
+        list(APPEND _pack_inputs ${_scene_inputs})
+        set(_scene_src_args --scene-src ${PACK_SCENE_SRC_DIR})
+    endif()
+
+    # The loose resource trees, merged into the package under their relative names. One
+    # --resource-dir per tree; the packer decides collisions with --on-conflict.
+    set(_resource_args "")
+    foreach(_res IN LISTS PACK_RESOURCE_DIR)
+        if (EXISTS ${_res})
+            file(GLOB_RECURSE _res_inputs CONFIGURE_DEPENDS ${_res}/*)
+            list(APPEND _pack_inputs ${_res_inputs})
+            list(APPEND _resource_args --resource-dir ${_res})
+        endif()
+    endforeach()
+    if (PACK_ON_CONFLICT)
+        list(APPEND _resource_args --on-conflict ${PACK_ON_CONFLICT})
+    endif()
+
+    # Mirroring: every resource a converted .wiscene embeds gets a loose copy here, and
+    # a file already present is left alone. This is what makes a map's SOURCE removable -
+    # the project holds its own copy of the textures from the first build, so archiving
+    # the .wiscene, or replacing it with the .stsd the editor saved, does not empty the
+    # package. It is deliberately the same directory as RESOURCE_DIR: what is mirrored
+    # out on one build is what gets merged back in on the next.
+    #
+    # NOTE: the first build that mirrors a new map writes files under a CONFIGURE_DEPENDS
+    # glob, so CMake re-configures once afterwards and packs a second time. The second
+    # pass writes nothing new and produces the same package - it converges.
+    if (PACK_MIRROR_DIR)
+        list(APPEND _resource_args --mirror-resources ${PACK_MIRROR_DIR})
+    endif()
+
+    if (NOT _pack_inputs)
+        message(STATUS "simtary_pack_assets(${PACK_TARGET}): nothing to pack, skipping")
+        return()
+    endif()
+
+    set(_stamp     ${CMAKE_CURRENT_BINARY_DIR}/${PACK_TARGET}_${PACK_NAME}.packstamp)
+    set(_pack_dir  $<TARGET_FILE_DIR:${PACK_TARGET}>/assets/${PACK_PACK_SUBDIR})
+    set(_scene_dir $<TARGET_FILE_DIR:${PACK_TARGET}>/assets/${PACK_SCENE_SUBDIR})
+
+    add_custom_command(
+        OUTPUT ${_stamp}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_pack_dir}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_scene_dir}
+        COMMAND $<TARGET_FILE:stpack> pack ${PACK_CONTENT_DIR}
+                --out ${_pack_dir}
+                --scene-dir ${_scene_dir}
+                ${_scene_src_args}
+                ${_resource_args}
+                --name ${PACK_NAME}
+                --part-size ${PACK_PART_SIZE}
+                --level ${PACK_LEVEL}
+        COMMAND ${CMAKE_COMMAND} -E touch ${_stamp}
+        DEPENDS ${_pack_inputs} stpack
+        COMMENT "Packing ${PACK_TARGET} content -> ${PACK_PACK_SUBDIR}/${PACK_NAME}.strd + .stafp<N>, maps -> ${PACK_SCENE_SUBDIR}/*.stsd"
+        VERBATIM
+    )
+
+    add_custom_target(${PACK_TARGET}_Pack DEPENDS ${_stamp})
+    set_target_properties(${PACK_TARGET}_Pack PROPERTIES FOLDER "${PACK_TARGET}/Build")
+    add_dependencies(${PACK_TARGET} ${PACK_TARGET}_Pack)
+
+    # Forces a repack even when nothing changed, for when the packer options moved or a
+    # part file was deleted by hand.
+    add_custom_target(${PACK_TARGET}_Repack
+        # The parts are wiped first: the packer never writes fewer files than last time,
+        # so a build that drops content would otherwise leave an orphaned .stafpN next
+        # to the new index, and the reader would refuse the whole set for a UUID it does
+        # not recognise.
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${_stamp}
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${_pack_dir}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_pack_dir}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_scene_dir}
+        COMMAND $<TARGET_FILE:stpack> pack ${PACK_CONTENT_DIR}
+                --out ${_pack_dir}
+                --scene-dir ${_scene_dir}
+                ${_scene_src_args}
+                ${_resource_args}
+                --name ${PACK_NAME}
+                --part-size ${PACK_PART_SIZE}
+                --level ${PACK_LEVEL}
+        COMMAND ${CMAKE_COMMAND} -E touch ${_stamp}
+        DEPENDS stpack
+        COMMENT "Re-packing ${PACK_TARGET} content from scratch"
+        VERBATIM
+    )
+    set_target_properties(${PACK_TARGET}_Repack PROPERTIES FOLDER "${PACK_TARGET}/Build")
+endfunction()
+
+# simtary_faust_regen()
+# Optional AOT Faust codegen. The generated instrument C++ is checked in so the
+# build works without the Faust compiler; if `faust` is on PATH this adds a target
+# that regenerates it (mirrors how dxc is found for shaders - a missing compiler is
+# a warning, never a hard error).
+#
+#   simtary_faust_regen(NAME organ CLASS OrganDSP
+#                       DSP assets/signal_descriptors/organ.dsp
+#                       OUTPUT src/audio/faust/processor/organ.gen.h)
+function(simtary_faust_regen)
+    cmake_parse_arguments(FA "" "NAME;CLASS;DSP;OUTPUT" "" ${ARGN})
+    # FAUST_ROOT (env or cache) points at a Faust install whose bin/ is not on PATH.
+    find_program(FAUST_PATH faust HINTS "${FAUST_ROOT}/bin" "$ENV{FAUST_ROOT}/bin" "C:/Program Files/Faust/bin")
+    if (NOT FAUST_PATH)
+        message(STATUS "Faust compiler not found - using the checked-in ${FA_OUTPUT}. "
+                       "Install a prebuilt 'faust' and re-run CMake to enable 'faust_regen_${FA_NAME}'.")
+        return()
+    endif()
+    message(STATUS "Faust compiler: ${FAUST_PATH} (target 'faust_regen_${FA_NAME}')")
+    # A vendored library tree wins when present; otherwise faust uses the stdfaust.lib
+    # that ships with the compiler install.
+    set(_faust_lib_args "")
+    if (EXISTS ${SIMTARY_ROOT}/libs/faust/libraries)
+        set(_faust_lib_args -I ${SIMTARY_ROOT}/libs/faust/libraries)
+    endif()
+    add_custom_target(faust_regen_${FA_NAME}
+        COMMAND ${FAUST_PATH} -lang cpp -cn ${FA_CLASS}
+            -a ${SIMTARY_ROOT}/assets/signal_descriptors/faust_arch.h
+            ${_faust_lib_args}
+            -o ${CMAKE_CURRENT_SOURCE_DIR}/${FA_OUTPUT}
+            ${CMAKE_CURRENT_SOURCE_DIR}/${FA_DSP}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "Regenerating ${FA_OUTPUT} from ${FA_DSP} via Faust"
+        VERBATIM
+    )
+endfunction()

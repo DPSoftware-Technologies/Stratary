@@ -1,0 +1,81 @@
+#pragma once
+// Scene Hierarchy (Explorer) + Properties (Inspector) debug UI.
+//
+//	Hierarchy lists every entity in the scene as a parent/child tree (built from the
+//	HierarchyComponent links) and lets you click one to select it. Properties shows the
+//	selected entity's components -- BOTH engine components (Transform, Light, Camera,
+//	Object, Material, Metadata, ...) and Native Components -- and edits them live: a
+//	change is written straight into the component and picked up by the next scene Update.
+//
+//	Engine-component edits are NOT persisted to disk on their own (they mutate the live
+//	scene); Native-Component "enabled" toggles do write metadata (see imnativecomponents.h).
+//
+//	Selection is just a wi::ecs::Entity the caller owns, so the two windows can live
+//	independently and share state without this module holding any global.
+
+#include "wiECS.h"
+
+#include <functional>
+#include <string>
+
+namespace wi::scene { struct Scene; struct NativeComponent; }
+namespace st { class EditorHistory; }
+
+// ImGui drag-drop payload type that Hierarchy rows publish and EntityField accepts.
+//	Payload is a single wi::ecs::Entity. Exposed so other panels can author drop targets too.
+inline constexpr const char* SIMTARY_ENTITY_PAYLOAD = "SIMTARY_ENTITY";
+
+// Unity-like "object field": a button you can drag an entity from the Hierarchy onto.
+//	Safe to draw inside the Properties panel: a Hierarchy drag does not change the selection, so
+//	the field under the cursor survives until the drop.
+//	Shows the current target's name (or "(none)"). On drop, points the native component's
+//	`paramName` entity-ref at the dropped entity and persists it to metadata (GUID-based, so it
+//	survives renames / duplicate names / scene reload, and stays editable in the Wicked Editor).
+//	Returns true on the frame the reference changed. Right-click clears the field.
+bool EntityField(wi::scene::Scene& scene, const char* label,
+	wi::scene::NativeComponent& comp, const char* paramName);
+
+// Emit the hierarchy tree into the CURRENT window (no Begin/End). Clicking a row writes
+//	the clicked entity into `selected`.
+//
+//	A row is a selection target, a drag SOURCE and a drop TARGET, so click and drag are told
+//	apart by the mouse release, not the press: selection only moves when the press and the
+//	release land on the same row without passing the drag threshold. Dragging a row therefore
+//	leaves `selected` (and with it the Properties panel you are dropping onto) exactly where it
+//	was. The panel shows which mode it is in above the tree, and tints the row being carried.
+//
+//	Dropping a row on ANOTHER ROW re-parents it (Scene::Component_Attach, which bakes the
+//	child's world transform into its new local one so it does not jump), and dropping it on the
+//	strip under the tree un-parents it. A target only opens when the drop would be legal
+//	never onto itself or one of its own descendants - so an illegal row does not highlight.
+//	Both are one undo step when a `history` is supplied.
+//
+//	`history` is optional. Pass one (Editor mode does) and the panel also grows a Create
+//	button and a right-click menu - create child / duplicate / delete - each recorded as a
+//	single undo step. Without it the panel is read-only apart from selection, which is what
+//	the plain DevUI Hierarchy window wants.
+//
+//	`scopeRoot` limits the panel to one subtree - the template preview's object. Rows outside
+//	it are not listed, Create and un-parent go UNDER it instead of to the top level (a row
+//	outside the subtree would not be saved), and the scope root itself cannot be deleted.
+void HierarchyGUI(wi::scene::Scene& scene, wi::ecs::Entity& selected,
+	st::EditorHistory* history = nullptr, wi::ecs::Entity scopeRoot = wi::ecs::INVALID_ENTITY);
+
+// "Save as Template..." in the row menu. The editor installs it; unset, the item is not shown.
+void SetSaveTemplateHandler(std::function<void(wi::scene::Scene&, wi::ecs::Entity)> handler);
+
+// The entity whose row was double-clicked since the last call, or INVALID_ENTITY. The
+//	caller of HierarchyGUI takes it right after drawing and frames its camera on it.
+wi::ecs::Entity TakeHierarchyDoubleClick();
+
+// Standalone "Hierarchy" window wrapper. p_open is optional (pass a bool* for a close box).
+void HierarchyWindow(wi::scene::Scene& scene, wi::ecs::Entity& selected, bool* p_open = nullptr);
+
+// Emit the inspector for `selected` into the CURRENT window (no Begin/End). Pass `selected`
+//	by reference so the panel can clear it (set to INVALID_ENTITY) when the entity is gone.
+//	`history` is optional; pass one to make every edit here undoable.
+void PropertiesGUI(wi::scene::Scene& scene, wi::ecs::Entity& selected,
+	st::EditorHistory* history = nullptr);
+
+// Standalone "Properties" window wrapper. p_open is optional.
+void PropertiesWindow(wi::scene::Scene& scene, wi::ecs::Entity& selected, bool* p_open = nullptr);
