@@ -1,10 +1,10 @@
-# Simtary
-A High Mobility Multipurpose Workspace Visualizator. Based on Wicked Engine
+# Stratary
+A **Game Ready Engine** platform. Based on Wicked Engine
 <img width="1920" height="1032" alt="Screenshot 2026-09-06 035900" src="https://github.com/user-attachments/assets/7c953d28-9f9c-42d9-b6e6-34aceb5f3fb5" />
 
 The shared engine for every app in this workspace.
 ```
-Simtary/
+Stratary/
 ├── Engine/         engine core
 ├── Framework/      the layer this workspace adds: st::App, st::Run, SceneManager,
 │                   system UI, io/NBT, input, crash, lens flare, projectors,
@@ -14,8 +14,8 @@ Simtary/
 ├── assets/         ImGui + StLensFlare + StProjector + StLaser shaders, faust_arch.h
 ├── shaders/        compiled engine shader cache — shared, committed
 ├── deps/           sentry-native + openal-soft + JSBSim clones (gitignored, reused)
-├── crashreporter/  SimtaryCrashReporter — one reporter GUI for all apps
-├── cmake/          SimtaryBootstrap / SimtaryApp / SimtaryPlatform / IncrementBuild
+├── crashreporter/  StrataryCrashReporter — one reporter GUI for all apps
+├── cmake/          StrataryBootstrap / StrataryApp / StrataryPlatform / IncrementBuild
 └── tests/ tools/
 ```
 
@@ -25,9 +25,9 @@ Simtary/
 cmake_minimum_required(VERSION 3.19)
 project(MyApp VERSION 1.0.0 LANGUAGES CXX)
 
-include(${CMAKE_CURRENT_SOURCE_DIR}/../Simtary/cmake/SimtaryBootstrap.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../Stratary/cmake/StrataryBootstrap.cmake)
 
-simtary_add_app(NAME MyApp ORGANIZATION "YourStudio" ICON assets/appicon.ico)
+Stratary_add_app(NAME MyApp ORGANIZATION "YourStudio" ICON assets/appicon.ico)
 ```
 
 ```cpp
@@ -175,7 +175,7 @@ config.organization = ST_PROJECT_ORGANIZATION;
 config.copyright    = ST_PROJECT_COPYRIGHT;
 ```
 
-Explicit `simtary_add_app()` arguments still win over the file, and a project with no
+Explicit `Stratary_add_app()` arguments still win over the file, and a project with no
 descriptor keeps the CMake defaults.
 
 Being NBT it is binary, so it is authored with the generator:
@@ -189,7 +189,7 @@ The tool reads the existing file first and changes only the flags you pass, so
 regenerating never drops keys the build does not know about. `--help` lists them all.
 
 CMake cannot parse NBT, and the values are needed *while* a project is configuring —
-before any of its targets can be built. So `SimtaryProject.cmake` configures and
+before any of its targets can be built. So `StrataryProject.cmake` configures and
 builds the reader from `tools/descriptor-bootstrap` (two files, no engine, no
 third-party) into `<build>/_descriptor` on the first configure, then runs it with
 `--cmake` and `include()`s the `set()` lines it prints. Later configures reuse the
@@ -269,10 +269,10 @@ first-launch shader/pipeline warm-up — and is overridable for custom art.
 
 ## CMake API
 
-- `simtary_add_app(NAME ... [ORGANIZATION] [ICON] [SOURCE_DIR] [ASSETS_DIR] [CONTENT_SUBDIR] [EXTRA_SOURCES|INCLUDES|LIBS] [NO_SHADER_WARM] [NO_CRASH_REPORTER])`
-- `simtary_compile_shader(TARGET ... SOURCE ... PROFILE ... [ENTRY] [OUTPUT_NAME])`
-- `simtary_faust_regen(NAME ... CLASS ... DSP ... OUTPUT ...)`
-- `Simtary::AppFlags` — the exceptions-off / RTTI-off contract. `simtary_add_app`
+- `Stratary_add_app(NAME ... [ORGANIZATION] [ICON] [SOURCE_DIR] [ASSETS_DIR] [CONTENT_SUBDIR] [EXTRA_SOURCES|INCLUDES|LIBS] [NO_SHADER_WARM] [NO_CRASH_REPORTER])`
+- `Stratary_compile_shader(TARGET ... SOURCE ... PROFILE ... [ENTRY] [OUTPUT_NAME])`
+- `Stratary_faust_regen(NAME ... CLASS ... DSP ... OUTPUT ...)`
+- `Stratary::AppFlags` — the exceptions-off / RTTI-off contract. `Stratary_add_app`
   links it; any other app-side target must link it too.
 
 ## Building the engine on its own
@@ -282,13 +282,13 @@ cmake --preset win_x86-64
 cmake --build --preset win_x86-64
 ```
 
-Add `-DSIMTARY_BUILD_PROJECTS=ON` to build every sibling app in the same tree — the
+Add `-DStratary_BUILD_PROJECTS=ON` to build every sibling app in the same tree — the
 fast way to check a framework change still compiles everywhere. `ctest` runs the
 framework tests.
 
 `build_number.txt` is project-level, so only a build of that project advances it: the
-sweep above forces `SIMTARY_BUMP_BUILD_NUMBER=OFF` and leaves every app's counter
-untouched. Pass `-DSIMTARY_BUMP_BUILD_NUMBER=OFF` by hand for CI or throwaway builds.
+sweep above forces `Stratary_BUMP_BUILD_NUMBER=OFF` and leaves every app's counter
+untouched. Pass `-DStratary_BUMP_BUILD_NUMBER=OFF` by hand for CI or throwaway builds.
 
 ## Graphics backend
 
@@ -325,11 +325,11 @@ Windows both are warmed, because either backend can be the one that launches. Af
 shader-heavy change, publish the result back:
 
 ```
-cmake --build <project>/build/win_x86-64 --target simtary_shadercache_update
+cmake --build <project>/build/win_x86-64 --target Stratary_shadercache_update
 ```
 
 The framework's own shaders (ImGui, lens flare, projector, laser) are built by
-`simtary_compile_shader`, which compiles each one for every backend the platform can
+`Stratary_compile_shader`, which compiles each one for every backend the platform can
 run. It uses `stshaderc` (`tools/stshaderc.cpp`) rather than `dxc.exe`: the dxc that
 ships with the Windows SDK cannot emit SPIR-V at all, so a Windows machine without the
 Vulkan SDK could not build a app that runs on Vulkan. `stshaderc` drives the
