@@ -3,6 +3,7 @@
 #include <SDL.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include "eventBus.h"
 #include "input/InputSystem.h"
 #include "io/asset/AssetSystem.h"
@@ -213,7 +214,8 @@ void st::App::SetLoadingStatus(std::string status, int percent) {
     // While the native window is up (startup, scene transitions) it is the only
     // thing that can paint - the main thread is blocked inside Scene::Load().
     m_loadingScreen.SetStatusText(loading_.status);
-    if (percent >= 0) m_loadingScreen.SetProgress(percent);
+    // Startup's bar covers more than the scene: the scene's share of it is 15-70%.
+    if (percent >= 0) m_loadingScreen.SetProgress(desktopWaiting_ ? 15 + percent * 55 / 100 : percent);
 }
 
 void st::App::OnAssetLoadProgress(const st::AssetLoadProgress& progress, void* userdata) {
@@ -247,6 +249,144 @@ void st::App::OnAssetLoadProgress(const st::AssetLoadProgress& progress, void* u
     // The bar is deliberately left alone. The engine owns it for the whole load and is
     // mid-phase here; driving it from a second source would make it jump backwards.
     // The n/total above is what shows this is progressing.
+}
+
+void st::App::StartupStage(const char* text, int percent) {
+    m_loadingScreen.SetStatusText(text);
+    if (desktopWaiting_) m_loadingScreen.SetProgress(percent);
+}
+
+bool st::App::BeginDesktopSplash(bool streaming) {
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+    if (st::IsHeadless() || streaming || wi::arguments::HasArgument("--no-splash") || wi::arguments::HasArgument("no-splash"))
+        return false;
+    // Hurricanes has no overlay to play the intro or to judge the world ready with.
+    if (st::render::ChosenBackend() != st::render::Backend::Detroit) return false;
+
+    std::string choice;
+    const bool chosen = wi::arguments::GetArgumentValue("--splash=", choice);
+    if (chosen && choice == "inwindow") return false;
+    if (!chosen || choice != "desktop") {
+        if (Config().splashMode == SplashMode::InWindow) return false;
+        if (Config().splashMode == SplashMode::Auto) {
+            // A compositor that shows one app at a time: a second window can take the screen.
+            const char* desktop = std::getenv("XDG_CURRENT_DESKTOP");
+            if (std::getenv("GAMESCOPE_WAYLAND_DISPLAY") != nullptr ||
+                (desktop != nullptr && std::strcmp(desktop, "gamescope") == 0))
+                return false;
+        }
+    }
+    if (Config().desktopSplashImage.empty()) return false;
+
+    // The same two places the BMP splash is read from: loose, then out of the package. Surface
+    // calls need no SDL_Init, which has not happened yet - this is the first thing on screen.
+    SDL_Surface* loaded = SDL_LoadBMP(Config().desktopSplashImage.c_str());
+    std::vector<uint8_t> bytes;
+    if (loaded == nullptr && st::AssetSystem::Get().Read(Config().desktopSplashImage, bytes) && !bytes.empty()) {
+        if (SDL_RWops* rw = SDL_RWFromConstMem(bytes.data(), (int)bytes.size()))
+            loaded = SDL_LoadBMP_RW(rw, 1);   // 1 = SDL closes the RWops
+    }
+    if (loaded == nullptr) {
+        wi::backlog::post("Desktop splash: no " + Config().desktopSplashImage + ", using the in-window splash");
+        return false;
+    }
+    // ARGB8888 is B, G, R, A in memory on a little-endian machine, which is what both window
+    // systems copy from.
+    SDL_Surface* bgra = SDL_ConvertSurfaceFormat(loaded, SDL_PIXELFORMAT_ARGB8888, 0);
+    SDL_FreeSurface(loaded);
+    if (bgra == nullptr) return false;
+
+    SplashArt art;
+    art.width = bgra->w;
+    art.height = bgra->h;
+    art.title = Config().name;
+    art.pixels.resize(size_t(art.width) * art.height);
+    for (int y = 0; y < art.height; ++y) {
+        const uint8_t* row = (const uint8_t*)bgra->pixels + size_t(y) * bgra->pitch;
+        std::memcpy(art.pixels.data() + size_t(y) * art.width, row, size_t(art.width) * 4);
+    }
+    SDL_FreeSurface(bgra);
+    for (uint32_t& p : art.pixels) p |= 0xFF000000u;   // a BMP's alpha is usually zero
+    const XMFLOAT3 bar = Config().splashBarColor;
+    art.barColor = 0xFF000000u | (uint32_t(bar.x * 255.0f) << 16) | (uint32_t(bar.y * 255.0f) << 8) | uint32_t(bar.z * 255.0f);
+
+    m_loadingScreen.SetTitle(Config().name);
+    m_loadingScreen.SetSplashArt(std::move(art));
+    m_loadingScreen.SetStatusText("starting engine");
+    m_loadingScreen.SetProgress(2);
+    m_loadingScreen.Show();
+    desktopWaiting_ = true;
+    desktopSplashStart_ = SDL_GetTicks64();
+    return true;
+#else
+    (void)streaming;
+    return false;
+#endif
+}
+
+st::render::detroit::SplashSettings st::App::MakeSplashSettings() const {
+    st::render::detroit::SplashSettings splash;
+    splash.image = Config().splashImage;
+    splash.video = Config().introVideo;
+    splash.background = Config().splashBackground;
+    splash.skippable = Config().splashSkippable;
+    splash.minSeconds = Config().splashMinSeconds;
+    splash.maxWaitSeconds = Config().splashWaitForWorld ? Config().splashMaxWaitSeconds : 0.0f;
+    splash.fadeSeconds = Config().splashFadeSeconds;
+    splash.volume = Config().splashVolume;
+    const char* env = std::getenv("SIMTARY_SPLASH_VIDEO");
+    const std::string envValue = env ? env : "";
+    // Someone opening the editor is there to work, not to watch the logo again.
+    if (envValue == "0" || envValue == "off" || envValue == "false" || startInEdit_ || editor_.IsEnabled() ||
+        wi::arguments::HasArgument("--no-intro") || wi::arguments::HasArgument("no-intro") ||
+        wi::arguments::HasArgument("--no-splash-video") || wi::arguments::HasArgument("no-splash-video"))
+        splash.video.clear();
+    return splash;
+}
+
+void st::App::RevealGameWindow() {
+    // Game window first, splash second, so the desktop never shows through between them.
+    SDL_ShowWindow(window);
+    SDL_RaiseWindow(window);
+    m_loadingScreen.Hide();
+    m_loadingScreen.ClearSplashArt();
+    loading_ = LoadingState{};
+}
+
+void st::App::UpdateDesktopSplash() {
+    std::string status;
+    const uint64_t elapsedMs = SDL_GetTicks64() - desktopSplashStart_;
+    const bool timedOut = float(elapsedMs) / 1000.0f >= Config().splashMaxWaitSeconds;
+    const bool worldReady = SplashWorldReady(status);
+    const bool ready = worldReady || !Config().splashWaitForWorld || timedOut;
+    if (timedOut && !worldReady) wi::backlog::post("Desktop splash: gave up waiting for the world (" + status + ")", wi::backlog::LogLevel::Warning);
+
+    if (!ready) {
+        m_loadingScreen.SetStatusText(status);
+        // The rest of the bar, from what the wait is on. It only ever moves forwards.
+        const int pipelines = st::render::Get().PipelinesCompiling();
+        splashPipelineMax_ = std::max(splashPipelineMax_, pipelines);
+        if (splashPipelineMax_ > 0)
+            m_loadingScreen.SetProgress(70 + 20 * (splashPipelineMax_ - pipelines) / splashPipelineMax_);
+        if (status == "Generating terrain") m_loadingScreen.SetProgress(92);
+        if (status == "Almost ready") m_loadingScreen.SetProgress(97);
+        return;
+    }
+
+    wi::backlog::post("Desktop splash: world ready after " + std::to_string(elapsedMs) + " ms");
+    desktopWaiting_ = false;
+    m_loadingScreen.SetProgress(100);
+
+    st::render::detroit::SplashSettings intro = MakeSplashSettings();
+    intro.image.clear();   // the picture was the desktop window's; the intro is only the video
+    if (intro.video.empty()) {
+        RevealGameWindow();
+        return;
+    }
+    // A couple of frames so the video is already on the swapchain when the window appears.
+    splashIntroOnly_ = true;
+    splash_.Start(intro);
+    revealWindowIn_ = 2;
 }
 
 void st::App::Initialize() {
@@ -305,12 +445,12 @@ void st::App::Initialize() {
         });
 
     // loading system assets
-    m_loadingScreen.SetStatusText("loading system assets");
+    StartupStage("loading system assets", 5);
     if (!Config().iconImage.empty() && !aboutEngineIcon.IsValid()) {
         aboutEngineIcon = wi::resourcemanager::Load(Config().iconImage);
     }
 
-    m_loadingScreen.SetStatusText("starting ImGui");
+    StartupStage("starting ImGui", 8);
     ImguiInit(window);   // also runs wi::Application::Initialize: the device and canvas are up
 
     // The render interface (render/api) - from here on Framework code draws through it.
@@ -376,7 +516,7 @@ void st::App::Initialize() {
 
     // Project hook: the game's keybinds. Before RegisterScenes, so a scene loaded
     // below already finds its action map registered when its stInput components start.
-    m_loadingScreen.SetStatusText("registering keybinds");
+    StartupStage("registering keybinds", 10);
     OnKeyRegister(st::InputSystem::Get().Actions());
 
     // Ensure the physics simulation actually steps (not just builds bodies). Some
@@ -385,7 +525,7 @@ void st::App::Initialize() {
     wi::physics::SetSimulationEnabled(true);
     InstallCollisionMeshLoader();
 
-    m_loadingScreen.SetStatusText("registering scenes");
+    StartupStage("registering scenes", 12);
     // Project hook: every scene the game owns is registered here, before the
     // starting scene is loaded below.
     RegisterScenes(sceneManager);
@@ -394,7 +534,7 @@ void st::App::Initialize() {
     // in wins both the name and its own map files, and everything else in the folder is
     // added next to it. See SceneManager::DiscoverScenes.
     if (Config().sceneAutoDiscover && !Config().sceneFolder.empty()) {
-        m_loadingScreen.SetStatusText("scanning scenes");
+        StartupStage("scanning scenes", 13);
         const int discovered = sceneManager.DiscoverScenes(Config().sceneFolder);
         wi::backlog::post("SceneManager: scanned " + Config().sceneFolder + ", " +
                           std::to_string(discovered) + " scene(s) added");
@@ -404,7 +544,7 @@ void st::App::Initialize() {
     // re-published on the main thread in Update() so scene subscribers stay
     // on-thread (the Wicked scene is not thread-safe).
     if (!Config().zmqEndpoint.empty()) {
-        m_loadingScreen.SetStatusText("starting zmq");
+        StartupStage("starting zmq", 14);
         zmqHandler.Start(Config().zmqEndpoint);
     }
 
@@ -443,7 +583,7 @@ void st::App::Initialize() {
         }
     }
     if (!startupScene.empty()) {
-        m_loadingScreen.SetStatusText("loading scene");
+        StartupStage("loading scene", 15);
         sceneManager.Load(startupScene);
         sceneManager.Update(0.0f); // flush pendingLoad_ now, not on the first Update
     }
@@ -453,28 +593,18 @@ void st::App::Initialize() {
     // The in-engine splash, over the first frames until the world is ready. Opened here,
     // under the native loading window, so the video's parse pass costs no visible time.
     // Not without a window, and not on Hurricanes: it draws through Detroit's device.
-    if (!st::IsHeadless() && st::render::ChosenBackend() == st::render::Backend::Detroit &&
+    if (!desktopWaiting_ && !st::IsHeadless() && st::render::ChosenBackend() == st::render::Backend::Detroit &&
         !wi::arguments::HasArgument("--no-splash") && !wi::arguments::HasArgument("no-splash")) {
-        st::render::detroit::SplashSettings splash;
-        splash.image = Config().splashImage;
-        splash.video = Config().splashVideo;
-        splash.background = Config().splashBackground;
-        splash.skippable = Config().splashSkippable;
-        splash.minSeconds = Config().splashMinSeconds;
-        splash.maxWaitSeconds = Config().splashWaitForWorld ? Config().splashMaxWaitSeconds : 0.0f;
-        splash.fadeSeconds = Config().splashFadeSeconds;
-        splash.volume = Config().splashVolume;
-        const char* env = std::getenv("SIMTARY_SPLASH_VIDEO");
-        const std::string envValue = env ? env : "";
-        if (envValue == "0" || envValue == "off" || envValue == "false" ||
-            wi::arguments::HasArgument("--no-splash-video") || wi::arguments::HasArgument("no-splash-video"))
-            splash.video.clear();
         m_loadingScreen.SetStatusText("opening splash");
-        splash_.Start(splash);
+        splash_.Start(MakeSplashSettings());
     }
 
-    m_loadingScreen.Hide(); // engine ready → tear the loading window down
-    loading_ = LoadingState{};   // nothing is loading any more
+    // Desktop splash: stays up over the first hidden frames, until the world is ready
+    // (UpdateDesktopSplash). Otherwise the engine is ready and the loading window goes.
+    if (!desktopWaiting_) {
+        m_loadingScreen.Hide();
+        loading_ = LoadingState{};   // nothing is loading any more
+    }
 }
 
 bool st::App::SplashWorldReady(std::string& status) {
@@ -673,7 +803,7 @@ void st::App::Update(float dt) {
     // this frame should not also take its first step in the same frame.
     st::ScriptSystem::Get().Update(sceneDt);
 
-    if (transitioning) {
+    if (transitioning && !desktopWaiting_) {
         m_loadingScreen.Hide();
         loading_ = LoadingState{};
     }
@@ -690,9 +820,11 @@ void st::App::Update(float dt) {
     renderer_->SetDebugOverlays(debugOverlays_);
 
     // Last: the verdict reads this frame's scene, terrain and pipeline state.
+    if (desktopWaiting_) UpdateDesktopSplash();
+    if (revealWindowIn_ >= 0 && revealWindowIn_-- == 0) RevealGameWindow();
     if (splash_.IsActive()) {
         std::string status;
-        const bool ready = SplashWorldReady(status) || !Config().splashWaitForWorld;
+        const bool ready = splashIntroOnly_ || SplashWorldReady(status) || !Config().splashWaitForWorld;
         splash_.Update(dt, ready, status);
     }
 }

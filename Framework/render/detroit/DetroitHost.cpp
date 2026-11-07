@@ -356,6 +356,15 @@ void DetroitRenderer::RenderImGui (CommandList cmd) {
         global_idx_offset += dl->IdxBuffer.Size;
         global_vtx_offset += dl->VtxBuffer.Size;
     }
+
+    // Leave the whole window drawable. Whatever composes after ImGui (the startup splash) was
+    // otherwise clipped to the last ImGui window's rectangle.
+    Rect fullWindow;
+    fullWindow.left = 0;
+    fullWindow.top = 0;
+    fullWindow.right = fb_width;
+    fullWindow.bottom = fb_height;
+    device->BindScissorRects(1, &fullWindow, cmd);
 }
 
 } // namespace st::render::detroit

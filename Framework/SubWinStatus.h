@@ -6,6 +6,8 @@
 #include <mutex>
 #include <thread>
 
+#include "SubWinSplashCanvas.h"
+
 // A small borderless loading window that runs on its OWN thread using the native
 // windowing API of each platform - Win32 + GDI on Windows, Xlib on Linux. No SDL.
 //
@@ -50,8 +52,19 @@ public:
     void SetDetailText(const std::string& text);    // second line, dimmed and elided
     void SetStatus(const std::string& text, const std::string& detail);
 
+    // Desktop splash look (AppConfig::desktopSplashImage). Set before Show(): the window then
+    // is the borderless picture instead of the plain dialog, the status and detail lines share
+    // one row, and the bar never moves backwards. ClearSplashArt() after Hide() goes back to
+    // the plain dialog for later scene changes.
+    void SetSplashArt(SplashArt art);
+    void ClearSplashArt();
+
 private:
-    void ThreadMain();   // window + render loop, runs on m_thread
+    void ThreadMain();         // window + render loop, runs on m_thread
+    void ThreadMainSplash();   // the same with the splash art, on m_thread
+    std::string SplashStatusLine();
+
+    SplashArt m_art;
 
     std::string m_title;
     int m_width;

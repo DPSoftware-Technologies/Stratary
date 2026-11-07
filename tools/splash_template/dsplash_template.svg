@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Desktop splash (dsplash.bmp). Painted at 1440 x 810, shown at 720 x 405 at 100% display
+     scale. Layers: paint in the first two, hide the last two before exporting. See README.md. -->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+     width="1440" height="810" viewBox="0 0 1440 810">
+  <defs>
+    <linearGradient id="stripFade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0a0a0a" stop-opacity="0"/>
+      <stop offset="1" stop-color="#0a0a0a" stop-opacity="1"/>
+    </linearGradient>
+    <pattern id="grid" width="72" height="72" patternUnits="userSpaceOnUse">
+      <path d="M72 0H0V72" fill="none" stroke="#3a3a3a" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <g id="art" inkscape:groupmode="layer" inkscape:label="1 ART - replace with your image">
+    <rect width="1440" height="810" fill="#000"/>
+    <rect width="1440" height="688" fill="url(#grid)"/>
+    <text x="720" y="350" text-anchor="middle" fill="#6a6a6a" font-family="DINish, sans-serif" font-size="44">YOUR ART</text>
+    <!-- Keep the strip dark so the engine's white text stays readable. -->
+    <rect y="608" width="1440" height="80" fill="url(#stripFade)"/>
+    <rect y="688" width="1440" height="122" fill="#0a0a0a"/>
+  </g>
+
+  <g id="logos" inkscape:groupmode="layer" inkscape:label="2 LOGOS - yours, part of the image">
+    <rect x="1040" y="704" width="372" height="86" fill="none" stroke="#4aa3ff" stroke-width="2" stroke-dasharray="8 6"/>
+    <text x="1226" y="755" text-anchor="middle" fill="#4aa3ff" font-family="DINish, sans-serif" font-size="24">your logos here</text>
+  </g>
+
+  <g id="engine-preview" inkscape:groupmode="layer" inkscape:label="3 ENGINE PREVIEW - hide before export">
+    <text x="28" y="742" fill="#fff" font-family="DINish, sans-serif" font-weight="700" font-size="40">My App Project</text>
+    <text x="28" y="782" fill="#fff" font-family="DINish, sans-serif" font-weight="300" font-size="26">Loading startup map: assets/scenes/vehicletest.stsd</text>
+    <rect y="802" width="980" height="8" fill="#ffff00"/>
+  </g>
+
+  <g id="guides" inkscape:groupmode="layer" inkscape:label="4 GUIDES - hide before export" font-family="DINish, sans-serif" font-size="18">
+    <rect x="1" y="688" width="1438" height="121" fill="none" stroke="#ff2a2a" stroke-width="2"/>
+    <text x="1432" y="680" text-anchor="end" fill="#ff5a5a">status strip: y 688-810 (15% of height)</text>
+    <rect x="28" y="700" width="980" height="94" fill="none" stroke="#ffb000" stroke-width="2" stroke-dasharray="8 6"/>
+    <text x="1000" y="722" text-anchor="end" fill="#ffb000">engine text: x 28-1008</text>
+    <text x="1432" y="800" text-anchor="end" fill="#ffff00" font-size="16">progress bar: y 802-810, full width</text>
+  </g>
+</svg>

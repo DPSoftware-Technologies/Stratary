@@ -1,5 +1,6 @@
 #include "render/detroit/DetroitSplash.h"
 
+#include "fonts/DinishFonts.h"
 #include "wiBacklog.h"
 #include "wiFont.h"
 #include "wiHelper.h"
@@ -267,6 +268,10 @@ void StartupSplash::Draw(const wi::Canvas& canvas, ColorSpace colorspace, Comman
         fp.size = 16;
         fp.color = wi::Color(255, 255, 255, 170);
         fp.shadowColor = wi::Color(0, 0, 0, 170);
+        // Added here, not at Start: the font system is certainly up by the first draw.
+        static const int lightStyle = wi::font::AddFontStyle("DINish-Light",
+            st::fonts::kDinishLight, st::fonts::kDinishLightSize);
+        fp.style = lightStyle;
         if (linear) fp.enableLinearOutputMapping(9);
         wi::font::Draw(status_, fp, cmd);
     }

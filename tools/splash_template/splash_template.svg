@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- In-window splash (splash.bmp). Layers: paint in the first, hide the others before
+     exporting. See README.md. Shown centred on the background colour, shrunk if the window
+     is smaller, so nothing is ever cropped. -->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+     width="1280" height="720" viewBox="0 0 1280 720">
+  <g id="art" inkscape:groupmode="layer" inkscape:label="1 ART - replace with your image, logos included">
+    <rect width="1280" height="720" fill="#000"/>
+    <text x="640" y="350" text-anchor="middle" fill="#6a6a6a" font-family="DINish, sans-serif" font-size="34">YOUR ART + LOGOS</text>
+    <text x="640" y="382" text-anchor="middle" fill="#6a6a6a" font-family="DINish, sans-serif" font-size="16">edges should match the background colour (black by default)</text>
+  </g>
+
+  <g id="engine-preview" inkscape:groupmode="layer" inkscape:label="2 ENGINE PREVIEW - hide before export">
+    <text x="640" y="692" text-anchor="middle" fill="#fff" fill-opacity="0.67" font-family="DINish, sans-serif" font-weight="300" font-size="16">Preparing shaders (12 left)</text>
+  </g>
+
+  <g id="guides" inkscape:groupmode="layer" inkscape:label="3 GUIDES - hide before export" font-family="DINish, sans-serif" font-size="13">
+    <rect x="1" y="672" width="1278" height="47" fill="none" stroke="#ff2a2a" stroke-width="2"/>
+    <text x="1272" y="666" text-anchor="end" fill="#ff5a5a">keep clear: status line while waiting, y 672-720</text>
+  </g>
+</svg>

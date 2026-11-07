@@ -55,6 +55,28 @@ void SubWinStatus::SetStatus(const std::string& text, const std::string& detail)
     m_detailText = detail;
 }
 
+void SubWinStatus::SetSplashArt(SplashArt art) {
+    m_art = std::move(art);
+    m_progress.store(0);
+}
+
+void SubWinStatus::ClearSplashArt() {
+    m_art = SplashArt{};
+    m_progress.store(0);
+}
+
+std::string SubWinStatus::SplashStatusLine() {
+    std::string line;
+    {
+        std::lock_guard<std::mutex> lock(m_textMutex);
+        line = m_statusText;
+        if (!m_detailText.empty()) line += "  -  " + m_detailText;
+    }
+    // The engine's phases are written lower case for the plain dialog.
+    if (!line.empty() && line[0] >= 'a' && line[0] <= 'z') line[0] = char(line[0] - 'a' + 'A');
+    return line;
+}
+
 // ============================================================================
 //  Windows - real Win32 dialog using native Common Controls v6 (themed look)
 // ============================================================================
@@ -62,6 +84,8 @@ void SubWinStatus::SetStatus(const std::string& text, const std::string& detail)
 
 #include <windows.h>
 #include <commctrl.h>
+#include <algorithm>
+#include <cmath>
 #pragma comment(lib, "comctl32.lib")
 // Pull in Common Controls v6 so the progress bar is the themed (Aero) style
 // instead of the legacy gray one. One string literal - do not wrap.
@@ -91,7 +115,110 @@ static LRESULT CALLBACK SubWinProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     return DefWindowProcA(h, msg, w, l);
 }
 
+static LRESULT CALLBACK SplashWinProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1; // the whole client area is painted from the canvas
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        if (const SplashCanvas* canvas = (const SplashCanvas*)GetWindowLongPtrA(h, GWLP_USERDATA)) {
+            BITMAPINFO bmi = {};
+            bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+            bmi.bmiHeader.biWidth = canvas->Width();
+            bmi.bmiHeader.biHeight = -canvas->Height(); // negative: top row first
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            SetDIBitsToDevice(dc, 0, 0, canvas->Width(), canvas->Height(), 0, 0, 0, canvas->Height(),
+                canvas->Pixels(), &bmi, DIB_RGB_COLORS);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_NCHITTEST:
+        return HTCAPTION; // no title bar, so the picture is what drags the window
+    case WM_CLOSE:
+        return 0; // closed programmatically by Hide()
+    }
+    return DefWindowProcA(h, msg, w, l);
+}
+
+void SubWinStatus::ThreadMainSplash() {
+    // This thread's window measures real pixels, so 100% and 200% displays both get the size
+    // they should instead of Windows stretching a blurry one.
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
+    const float dpiScale = (float)GetDpiForSystem() / 96.0f;
+
+    RECT work = {};
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0);
+    const int workW = work.right - work.left;
+    const int workH = work.bottom - work.top;
+
+    // Half the image's pixels at 100%, then never more than most of the screen.
+    float scale = 0.5f * dpiScale;
+    scale = std::min(scale, 0.9f * (float)workW / (float)m_art.width);
+    scale = std::min(scale, 0.9f * (float)workH / (float)m_art.height);
+    const int width = std::max(1, (int)((float)m_art.width * scale));
+    const int height = std::max(1, (int)((float)m_art.height * scale));
+
+    SplashCanvas canvas(m_art, width, height);
+    canvas.Render(SplashStatusLine(), 0.0f);
+
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+    const char* CLS = "StrataryDesktopSplash";
+    WNDCLASSA wc = {};
+    wc.style         = CS_DROPSHADOW;
+    wc.lpfnWndProc   = SplashWinProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursor(nullptr, IDC_APPSTARTING);
+    wc.lpszClassName = CLS;
+    RegisterClassA(&wc);
+
+    std::string title;
+    { std::lock_guard<std::mutex> lock(m_textMutex); title = m_title; }
+
+    // WS_EX_APPWINDOW: the game window is hidden, so this is the app's entry on the taskbar.
+    HWND hwnd = CreateWindowExA(WS_EX_APPWINDOW, CLS, title.c_str(), WS_POPUP,
+        work.left + (workW - width) / 2, work.top + (workH - height) / 2, width, height,
+        nullptr, nullptr, hInst, nullptr);
+    if (!hwnd) { m_running = false; return; }
+    SetWindowLongPtrA(hwnd, GWLP_USERDATA, (LONG_PTR)&canvas);
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    UpdateWindow(hwnd);
+
+    std::string lastLine;
+    float shown = 0.0f;
+    float lastShown = -1.0f;
+    float target = 0.0f;
+    while (m_running.load()) {
+        MSG msg;
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+        const std::string line = SplashStatusLine();
+        target = std::max(target, (float)m_progress.load());
+        shown += (target - shown) * 0.15f;
+        if (line != lastLine || std::abs(shown - lastShown) > 0.05f) {
+            canvas.Render(line, shown);
+            lastLine = line;
+            lastShown = shown;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            UpdateWindow(hwnd);
+        }
+        Sleep(16);
+    }
+
+    // The canvas goes with this function; nothing may paint from it afterwards.
+    SetWindowLongPtrA(hwnd, GWLP_USERDATA, 0);
+    DestroyWindow(hwnd);
+    UnregisterClassA(CLS, hInst);
+}
+
 void SubWinStatus::ThreadMain() {
+    if (!m_art.pixels.empty()) { ThreadMainSplash(); return; }
+
     HINSTANCE hInst = GetModuleHandleW(nullptr);
 
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES };
@@ -239,6 +366,11 @@ void SubWinStatus::ThreadMain() {
 // ============================================================================
 #include <unistd.h>
 
+void SubWinStatus::ThreadMainSplash() {
+    while (m_running.load())
+        usleep(16000);
+}
+
 void SubWinStatus::ThreadMain() {
     while (m_running.load())
         usleep(16000);
@@ -252,7 +384,10 @@ void SubWinStatus::ThreadMain() {
 //   dependency-light and matches the dark loading style.)
 // ============================================================================
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <unistd.h>
+#include <algorithm>
+#include <cmath>
 
 namespace {
 // X11 has no equivalent of SS_PATHELLIPSIS, so the middle of an over-long path is
@@ -279,7 +414,74 @@ std::string ElideMiddle(XFontStruct* font, const std::string& text, int maxWidth
 }
 } // namespace
 
+void SubWinStatus::ThreadMainSplash() {
+    Display* dpy = XOpenDisplay(nullptr);    // this thread owns this connection
+    if (!dpy) { m_running = false; return; }
+
+    const int screen = DefaultScreen(dpy);
+    const int sw = DisplayWidth(dpy, screen);
+    const int sh = DisplayHeight(dpy, screen);
+
+    // X has no one answer for display scale, so a screen this tall counts as 200%.
+    float scale = sh >= 2000 ? 1.0f : 0.5f;
+    scale = std::min(scale, 0.9f * (float)sw / (float)m_art.width);
+    scale = std::min(scale, 0.9f * (float)sh / (float)m_art.height);
+    const int width = std::max(1, (int)((float)m_art.width * scale));
+    const int height = std::max(1, (int)((float)m_art.height * scale));
+
+    SplashCanvas canvas(m_art, width, height);
+
+    XSetWindowAttributes attrs;
+    attrs.override_redirect = True;
+    attrs.background_pixel  = 0;
+    attrs.event_mask        = ExposureMask;
+    Window win = XCreateWindow(dpy, RootWindow(dpy, screen), (sw - width) / 2, (sh - height) / 2,
+        width, height, 0, CopyFromParent, InputOutput, CopyFromParent,
+        CWOverrideRedirect | CWBackPixel | CWEventMask, &attrs);
+    XMapRaised(dpy, win);
+    GC gc = XCreateGC(dpy, win, 0, nullptr);
+
+    // The canvas is 32-bit BGRA, which is how a 24-bit-depth X server lays out its pixels.
+    XImage* image = XCreateImage(dpy, DefaultVisual(dpy, screen), DefaultDepth(dpy, screen), ZPixmap, 0,
+        (char*)canvas.Pixels(), width, height, 32, 0);
+
+    std::string lastLine;
+    float shown = 0.0f;
+    float lastShown = -1.0f;
+    float target = 0.0f;
+    bool exposed = true;
+    while (m_running.load()) {
+        while (XPending(dpy)) {
+            XEvent ev;
+            XNextEvent(dpy, &ev);
+            if (ev.type == Expose) exposed = true;
+        }
+        const std::string line = SplashStatusLine();
+        target = std::max(target, (float)m_progress.load());
+        shown += (target - shown) * 0.15f;
+        if (line != lastLine || std::abs(shown - lastShown) > 0.05f || exposed) {
+            canvas.Render(line, shown);
+            if (image) XPutImage(dpy, win, gc, image, 0, 0, 0, 0, width, height);
+            XFlush(dpy);
+            lastLine = line;
+            lastShown = shown;
+            exposed = false;
+        }
+        usleep(16000);
+    }
+
+    if (image) {
+        image->data = nullptr; // the canvas owns the pixels, and XDestroyImage would free them
+        XDestroyImage(image);
+    }
+    XFreeGC(dpy, gc);
+    XDestroyWindow(dpy, win);
+    XCloseDisplay(dpy);
+}
+
 void SubWinStatus::ThreadMain() {
+    if (!m_art.pixels.empty()) { ThreadMainSplash(); return; }
+
     Display* dpy = XOpenDisplay(nullptr);    // this thread owns this connection
     if (!dpy) { m_running = false; return; }
 

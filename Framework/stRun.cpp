@@ -252,6 +252,10 @@ int st::Run(int argc, char* argv[], AppConfig& config, App& application) {
     }
     if (st::AssetSystem::Get().MountCount() > 0) st::AssetSystem::Get().Install();
 
+    // The first thing on screen: everything after this takes time. Needs the packs (the image
+    // is in them) and decides how the game window below is created.
+    const bool desktopSplash = application.BeginDesktopSplash(st::stream::StreamHost::Get().Requested());
+
     printf("Starting crash reporter.\n");
     st::crash::Init(argv[0], config.name.c_str());
 
@@ -278,7 +282,7 @@ int st::Run(int argc, char* argv[], AppConfig& config, App& application) {
     // exactly the stream's size - the render path then renders at the size that is encoded.
     const bool streamHidden = st::stream::StreamHost::Get().Requested() &&
                               !st::stream::StreamHost::Get().GetOptions().showWindow;
-    Uint32 windowFlags = (streamHidden ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN) | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+    Uint32 windowFlags = ((streamHidden || desktopSplash) ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN) | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
     if (st::stream::StreamHost::Get().Requested()) {
         windowFlags &= ~Uint32(SDL_WINDOW_ALLOW_HIGHDPI);   // 1 window pixel = 1 video pixel
         config.windowWidth = int(st::stream::StreamHost::Get().GetOptions().width);
@@ -308,7 +312,7 @@ int st::Run(int argc, char* argv[], AppConfig& config, App& application) {
     // torn down before Vulkan can take the same ANativeWindow.
     const bool showSplash = false;
 #else
-    const bool showSplash = !config.splashImage.empty() && !g_headless && !streamHidden;
+    const bool showSplash = !config.splashImage.empty() && !g_headless && !streamHidden && !desktopSplash;
 #endif
     if (showSplash) {
         // SOFTWARE renderer - Vulkan ain't active yet, use this!

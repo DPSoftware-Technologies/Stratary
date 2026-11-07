@@ -1367,6 +1367,28 @@ void EditorBridge::RegisterAll () {
             if (!np.Start(app.Editor(), wi::scene::GetScene(), clients, a["serverWindow"].AsBool())) { err = np.LastError(); return Value(); }
             return Value(true);
         });
+    Register("editor.view", "{ortho?, direction?: [x,y,z] each -1/0/1 (eye side, [0,1,0] = top)} -> Editor Viewport camera state; changes apply over the next frames",
+        [&app](const Value& a, std::string& err) {
+        st::EditorUI& editor = app.Editor();
+        if (a.Has("ortho")) {
+            editor.RequestViewOrtho(a["ortho"].AsBool());
+        }
+        XMFLOAT3 d;
+        if (a.Has("direction")) {
+            if (!ReadVec3(a["direction"], d)) {
+                err = "direction must be [x,y,z]";
+                return Value();
+            }
+            editor.RequestViewDirection((int)d.x, (int)d.y, (int)d.z);
+        }
+        Value o = Value::Object();
+        o.Set("ortho", editor.ViewIsOrtho());
+        o.Set("ortho_size", editor.ViewOrthoSize());
+        o.Set("position", Vec3(editor.ViewPosition()));
+        o.Set("rotation", Vec3(editor.ViewRotation()));
+        return o;
+    });
+
     Register("editor.mode", "{on} -> editor mode on/off", [&app](const Value& a, std::string&) {
         if (a.Has("on")) {
             if (a["on"].AsBool() && !app.IsDevUIVisible()) app.SetDevUIVisible(true);

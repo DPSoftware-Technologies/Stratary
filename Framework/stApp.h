@@ -57,6 +57,9 @@ namespace st {
 // bar, backlog, graphics settings, hierarchy/properties, scene manager and Faust
 // panel - tooling, not game UI. A game's own UI (App::RenderUI, Scene::OnGUI) is
 // never affected by this.
+// Where startup shows its loading picture: see AppConfig::splashMode.
+enum class SplashMode { Auto, Desktop, InWindow };
+
 enum class DevUIMode {
     Visible,   // starts open - the development default
     Hidden,    // compiled in but starts closed; AppConfig::devUIToggleKey opens it
@@ -98,7 +101,7 @@ struct AppConfig {
     // An intro video to play first, as a TJC stream (Framework/video). Empty = none; the
     // splashImage is held instead. SIMTARY_SPLASH_VIDEO=0 in the environment (or
     // --no-splash-video) skips it for one run; --no-splash skips the whole overlay.
-    std::string splashVideo;
+    std::string introVideo;
     bool  splashWaitForWorld   = true;    // false: fade as soon as the video ends
     bool  splashSkippable      = true;    // key / click / tap ends the video (never the wait)
     float splashMinSeconds     = 0.0f;    // shortest time the overlay stays, video included
@@ -106,6 +109,18 @@ struct AppConfig {
     float splashFadeSeconds    = 0.5f;
     float splashVolume         = 1.0f;
     XMFLOAT3 splashBackground  = XMFLOAT3(0, 0, 0);   // behind the letterboxed video
+
+    // Where the loading picture is shown (tools/splash_template has the art templates).
+    //   Desktop   a borderless window showing desktopSplashImage with live status; the game
+    //             window stays hidden until the world is ready, then introVideo plays in it
+    //   InWindow  splashImage inside the game window, introVideo over the first frames
+    //   Auto      Desktop, except where there is no second window to show or nobody to see
+    //             it: Android, a stream (--stream), gamescope (SteamOS game mode)
+    // --splash=desktop|inwindow overrides it for one run. Android and --stream are always
+    // InWindow, and a missing desktopSplashImage falls back to InWindow.
+    SplashMode splashMode = SplashMode::Auto;
+    std::string desktopSplashImage = "assets/dsplash.bmp";
+    XMFLOAT3 splashBarColor = XMFLOAT3(1, 1, 0);      // the desktop splash's progress bar
 
     // Icon shown in the About window. Empty = none.
     std::string iconImage   = "assets/icon.png";
@@ -300,6 +315,9 @@ public:
 
     // The in-engine startup splash (AppConfig::splash*). st::Run holds input back while
     // it blocks, and turns a press into SkipSplashVideo() when the video is skippable.
+    // Bring up the desktop splash, if this run uses one. True: the game window should be
+    // created hidden, and is shown when the world is ready. Called by st::Run.
+    bool BeginDesktopSplash(bool streaming);
     bool SplashActive() const { return splash_.IsActive(); }
     bool SplashBlocksInput() const { return splash_.BlocksInput(); }
     bool SplashSkippable() const { return splash_.Skippable(); }
@@ -500,6 +518,15 @@ private:
 
     // Startup splash, and the frame counters behind its "world ready" verdict.
     st::render::detroit::StartupSplash splash_;
+    void StartupStage(const char* text, int percent);
+    void UpdateDesktopSplash();
+    void RevealGameWindow();
+    st::render::detroit::SplashSettings MakeSplashSettings() const;
+    bool desktopWaiting_    = false;  // desktop splash up, game window hidden, world not ready
+    bool splashIntroOnly_   = false;  // the overlay is only the intro: the world is already ready
+    int  revealWindowIn_    = -1;     // frames until the game window is shown, < 0: not pending
+    int  splashPipelineMax_ = 0;      // most pipeline jobs seen, for the desktop bar
+    uint64_t desktopSplashStart_ = 0; // SDL ticks
     bool SplashWorldReady(std::string& status);
     int  splashFrames_       = 0;     // frames since the splash started
     int  splashPipelineIdle_ = 0;     // consecutive frames with no pipeline job in flight

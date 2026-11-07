@@ -883,6 +883,12 @@ void st::EditorUI::DrawToolbar()
 		ImGui::SetTooltip("Gizmo space (scale is always local)");
 
 	ImGui::Separator();
+	if (ImGui::SmallButton(camOrtho_ ? "Ortho" : "Persp"))
+		viewOrthoRequest_ = camOrtho_ ? 0 : 1;
+	if (ImGui::IsItemHovered())
+		ImGui::SetTooltip("Editor Viewport projection: perspective or orthographic");
+
+	ImGui::Separator();
 	ImGui::Checkbox("Snap", &gizmoSnap_);
 	if (gizmoSnap_)
 	{
@@ -1196,15 +1202,19 @@ void st::EditorUI::DrawViewport(const char* title, bool* p_open, wi::RenderPath3
 	bool terrainBusy = false;
 	if (imageDrawn)
 		terrainBusy = terrain_.ViewportInput(scene, history_, path, cam, imagePos, imageSize,
-			hovered, ImGui::GetIO().DeltaTime);
+			hovered && !viewCubeHot_, ImGui::GetIO().DeltaTime);
 
 	bool gizmoBusy = false;
 	if (imageDrawn && selected != INVALID_ENTITY && !terrainBusy)
 		gizmoBusy = DrawGizmo(scene, selected, cam, imagePos, imageSize);
 
+	// After the gizmo, so it draws on top. Its hover from LAST frame is what keeps the gizmo
+	//	and the terrain brush from taking a click meant for the cube.
+	viewCubeHot_ = imageDrawn && DrawViewCube(scene, selected, imagePos, imageSize);
+
 	// Click to select. Skipped while the pointer is on the gizmo, otherwise grabbing an
 	// axis would immediately reselect whatever is behind it.
-	if (hovered && !gizmoBusy && !terrainBusy && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+	if (hovered && !gizmoBusy && !terrainBusy && !viewCubeHot_ && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
 	{
 		const ImVec2 m = ImGui::GetIO().MousePos;
 		const float u = (m.x - imagePos.x) / std::max(1.0f, imageSize.x);
@@ -1545,6 +1555,11 @@ void st::EditorUI::FrameSelected(wi::scene::Scene& scene, Entity selected)
 	camFlyFrom_ = camPos_;
 	XMStoreFloat3(&camFlyTo_, XMVectorSubtract(XMLoadFloat3(&target), XMVectorScale(forward, distance)));
 	camFlyT_ = 0.0f;
+	camOrbitT_ = -1.0f;
+	camPivotDist_ = distance;
+	// Moving the eye frames nothing in ortho; the view height has to fit the bounds instead.
+	camFlyOrthoFrom_ = camOrthoSize_;
+	camFlyOrthoTo_ = radius * 2.0f * 1.15f;
 }
 
 void st::EditorUI::StepCamFly(float dt)
@@ -1555,6 +1570,8 @@ void st::EditorUI::StepCamFly(float dt)
 	camFlyT_ = std::min(1.0f, camFlyT_ + dt / kFlyTime);
 	const float s = 1.0f - (1.0f - camFlyT_) * (1.0f - camFlyT_) * (1.0f - camFlyT_); // ease out
 	XMStoreFloat3(&camPos_, XMVectorLerp(XMLoadFloat3(&camFlyFrom_), XMLoadFloat3(&camFlyTo_), s));
+	if (camOrtho_)
+		camOrthoSize_ = camFlyOrthoFrom_ + (camFlyOrthoTo_ - camFlyOrthoFrom_) * s;
 	if (camFlyT_ >= 1.0f)
 		camFlyT_ = -1.0f;
 }
@@ -1594,6 +1611,8 @@ void st::EditorUI::UpdateFreeCam(float dt, bool interactive)
 		camRot_.y += d.x * camSens_;
 		camRot_.x += d.y * camSens_;
 		camRot_.x = std::clamp(camRot_.x, -kPitchLimit, kPitchLimit);
+		camRot_.z = 0.0f; // a roll from the view cube would turn mouse look into a corkscrew
+		camOrbitT_ = -1.0f;
 		ImGui::SetMouseCursor(ImGuiMouseCursor_None);
 	}
 
@@ -1601,11 +1620,33 @@ void st::EditorUI::UpdateFreeCam(float dt, bool interactive)
 	float strafe = 0.0f;
 	float up = 0.0f;
 
-	// Wheel sets the fly speed while flying, and dollies the camera otherwise.
+	// Middle button pans, the same distance on screen as the mouse moved.
+	if (!flying && ImGui::IsMouseDown(ImGuiMouseButton_Middle) && (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f))
+	{
+		const float metresPerPixel = ViewHeightAtPivot() / std::max(1.0f, viewImageHeight_);
+		const XMVECTOR q = XMQuaternionRotationRollPitchYaw(camRot_.x, camRot_.y, camRot_.z);
+		const XMVECTOR panRight = XMVector3Rotate(XMVectorSet(1, 0, 0, 0), q);
+		const XMVECTOR panUp = XMVector3Rotate(XMVectorSet(0, 1, 0, 0), q);
+		XMVECTOR pos = XMLoadFloat3(&camPos_);
+		pos = XMVectorSubtract(pos, XMVectorScale(panRight, io.MouseDelta.x * metresPerPixel));
+		pos = XMVectorAdd(pos, XMVectorScale(panUp, io.MouseDelta.y * metresPerPixel));
+		XMStoreFloat3(&camPos_, pos);
+		camFlyT_ = -1.0f;
+		camOrbitT_ = -1.0f;
+	}
+
+	// Wheel sets the fly speed while flying, and dollies the camera otherwise. Ortho has no
+	//	dolly (distance changes nothing on screen), so the wheel changes the view height.
 	if (io.MouseWheel != 0.0f)
 	{
 		if (flying)
 			camSpeed_ = std::clamp(camSpeed_ * (io.MouseWheel > 0.0f ? 1.25f : 0.8f), 0.05f, 2000.0f);
+		else if (camOrtho_)
+		{
+			camOrthoSize_ = std::clamp(camOrthoSize_ * std::pow(0.85f, io.MouseWheel), 0.02f, 100000.0f);
+			camFlyT_ = -1.0f;
+			camOrbitT_ = -1.0f;
+		}
 		else
 			fwd += io.MouseWheel * 25.0f;
 	}
@@ -1623,11 +1664,19 @@ void st::EditorUI::UpdateFreeCam(float dt, bool interactive)
 	if (fwd == 0.0f && strafe == 0.0f && up == 0.0f && !flying)
 		return;
 	camFlyT_ = -1.0f; // the user took the camera back mid-flight
+	camOrbitT_ = -1.0f;
 	if (fwd == 0.0f && strafe == 0.0f && up == 0.0f)
 		return;
 
 	const bool boost = ImGui::IsKeyDown(ImGuiKey_LeftShift);
 	const float step = camSpeed_ * (boost ? camBoost_ : 1.0f) * dt;
+
+	// W/S while flying zoom in ortho, for the same reason the wheel does.
+	if (camOrtho_ && fwd != 0.0f)
+	{
+		camOrthoSize_ = std::clamp(camOrthoSize_ * std::exp(-fwd * dt * (boost ? 3.0f : 1.0f)), 0.02f, 100000.0f);
+		fwd = 0.0f;
+	}
 
 	const XMVECTOR q       = XMQuaternionRotationRollPitchYaw(camRot_.x, camRot_.y, camRot_.z);
 	const XMVECTOR forward = XMVector3Rotate(XMVectorSet(0, 0, 1, 0), q);
@@ -2701,6 +2750,7 @@ void st::EditorUI::Draw(App& app, wi::RenderPath3D& gamePath, Entity& selected)
 	//	has to be the free camera, or you would be sculpting ground that is not there; the
 	//	moment the Game Viewport has input it goes back to the game camera.
 	StepCamFly(ImGui::GetIO().DeltaTime);
+	StepCamOrbit(ImGui::GetIO().DeltaTime);
 	st::terrain::TerrainSystem::Get().SetFocus(editorViewLive_ && !gameViewFocused_, camPos_);
 
 	if (showTerrain_)
@@ -2872,6 +2922,17 @@ void st::EditorUI::RenderEditorView(float dt)
 	// projection aspect from those.
 	TransformComponent camTransform;
 	camTransform.translation_local = camPos_;
+	if (camOrtho_)
+	{
+		// Parallel rays make the eye's distance invisible on screen, so it can sit behind
+		//	camPos_: whatever the camera has flown past stays in front of the near plane. Not
+		//	too far though - fog is measured from the eye, and at 2500 m the frame was all fog.
+		const float pullBack = std::min(std::max(300.0f, camOrthoSize_), camFar_ * 0.5f);
+		const XMVECTOR q = XMQuaternionRotationRollPitchYaw(camRot_.x, camRot_.y, camRot_.z);
+		const XMVECTOR forward = XMVector3Rotate(XMVectorSet(0, 0, 1, 0), q);
+		XMStoreFloat3(&camTransform.translation_local,
+			XMVectorSubtract(XMLoadFloat3(&camPos_), XMVectorScale(forward, pullBack)));
+	}
 	camTransform.RotateRollPitchYaw(camRot_);
 	camTransform.UpdateTransform();
 
@@ -2883,6 +2944,8 @@ void st::EditorUI::RenderEditorView(float dt)
 	editorCamera_.fov    = camFov_;
 	editorCamera_.zNearP = camNear_;
 	editorCamera_.zFarP  = camFar_;
+	editorCamera_.SetOrtho(camOrtho_);
+	editorCamera_.ortho_vertical_size = camOrthoSize_;
 	editorCamera_.UpdateCamera();
 
 	ApplyViewportRenderer(*editorPath_, showGamePreview_);

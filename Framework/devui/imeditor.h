@@ -99,6 +99,14 @@ public:
     void SetEnabled(bool on);
     void Toggle() { SetEnabled(!enabled_); }
 
+    // Editor Viewport view, for tools (bridge editor.view). Applied on the next Draw().
+    void RequestViewOrtho(bool ortho) { viewOrthoRequest_ = ortho ? 1 : 0; }
+    void RequestViewDirection(int x, int y, int z) { viewFaceRequest_ = XMINT3(x, y, z); viewFaceRequested_ = true; }
+    bool ViewIsOrtho() const { return camOrtho_; }
+    float ViewOrthoSize() const { return camOrthoSize_; }
+    XMFLOAT3 ViewPosition() const { return camPos_; }
+    XMFLOAT3 ViewRotation() const { return camRot_; }
+
     // Raise the docked Resource Explorer. Called when a file is dropped on the window,
     // so the drop lands somewhere visible instead of into a hidden panel.
     void ShowResources() { showResources_ = true; }
@@ -241,6 +249,17 @@ private:
     // fraction of a second (StepCamFly, each frame); moving it yourself cancels the flight.
     void FrameSelected(wi::scene::Scene& scene, wi::ecs::Entity selected);
     void StepCamFly(float dt);
+
+    // View cube + orthographic view (imviewcube.cpp). DrawViewCube returns true while the
+    // pointer is on it, so nothing behind it reacts to the click.
+    bool DrawViewCube(wi::scene::Scene& scene, wi::ecs::Entity selected, ImVec2 imagePos, ImVec2 imageSize);
+    float CamPivotDistance(wi::scene::Scene& scene, wi::ecs::Entity selected) const;
+    void StartCamOrbit(XMFLOAT3 toRot, float distance);
+    void PlaceCamOnOrbit();
+    void StepCamOrbit(float dt);
+    void OrbitToDirection(wi::scene::Scene& scene, wi::ecs::Entity selected, int dx, int dy, int dz);
+    void SetCamOrtho(wi::scene::Scene& scene, wi::ecs::Entity selected, bool ortho);
+    float ViewHeightAtPivot() const;
 
     // Dispatches on the extension: ".wiscene" writes a plain wi::Archive, anything
     // else (including no extension) writes the native .stsd.
@@ -458,6 +477,26 @@ private:
     XMFLOAT3 camFlyFrom_ = XMFLOAT3(0, 0, 0);
     XMFLOAT3 camFlyTo_   = XMFLOAT3(0, 0, 0);
     float    camFlyT_    = -1.0f;                // < 0: not flying
+    float    camFlyOrthoFrom_ = 0.0f;
+    float    camFlyOrthoTo_   = 0.0f;
+    // Orthographic: camOrthoSize_ is the view height in metres. The eye is drawn pulled back
+    // along the view (RenderEditorView), so what is just behind camPos_ is not clipped.
+    bool     camOrtho_     = false;
+    float    camOrthoSize_ = 10.0f;
+    // How far ahead of the camera it orbits; also what ortho and perspective zoom convert by.
+    float    camPivotDist_ = 10.0f;
+    XMFLOAT3 camOrbitPivot_ = XMFLOAT3(0, 0, 0);
+    XMFLOAT3 camOrbitFrom_  = XMFLOAT3(0, 0, 0);
+    XMFLOAT3 camOrbitTo_    = XMFLOAT3(0, 0, 0);
+    float    camOrbitT_     = -1.0f;             // < 0: not orbiting
+    float    viewImageHeight_ = 1.0f;            // viewport image, ImGui pixels
+    bool     viewCubeHot_        = false;        // last frame's DrawViewCube result
+    bool     viewCubeDragged_    = false;
+    float    viewCubeAlpha_      = 0.35f;
+    bool     viewCubeDownOnCube_ = false;
+    int      viewOrthoRequest_   = -1;           // -1 none, else 0/1, applied by DrawViewCube
+    bool     viewFaceRequested_  = false;
+    XMINT3   viewFaceRequest_    = XMINT3(0, 0, 0);
     float camNear_   = 0.1f;
     float camFar_    = 5000.0f;
     bool  camInitialized_ = false; // snapped to the game camera on first open
