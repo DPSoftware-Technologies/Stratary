@@ -337,5 +337,8 @@ Vulkan SDK could not build a app that runs on Vulkan. `stshaderc` drives the
 DX12 root signature and the Vulkan binding shifts come from the engine's own constants
 instead of a copy of them in CMake.
 
+# Showcase
+<img width="1920" height="1032" alt="Screenshot 2026-10-28 025157" src="https://github.com/user-attachments/assets/56268970-7db4-4e9d-a1f5-9d381bafbf83" />
+
 # New app from Template
 Please Contact to `contact@platoonlabs.com` for get template project.
